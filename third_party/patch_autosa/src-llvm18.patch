@@ -1,0 +1,53 @@
+diff --git src/Makefile.am src/Makefile.am
+index 06ca12a..fa325ba 100644
+--- src/Makefile.am
++++ src/Makefile.am
+@@ -29,9 +29,10 @@ LIB_BARVINOK = $(BARVINOK_LA) @BARVINOK_LIBS@
+ LIB_PET = $(PET_LA) @PET_LIBS@
+ 
+ AM_CPPFLAGS = @ISL_CFLAGS@ @BARVINOK_CFLAGS@ @PET_CFLAGS@
+-LDADD = $(LIB_PET) $(LIB_ISL) $(LIB_BARVINOK)
++LDADD = $(LIB_PET) $(LIB_ISL) $(LIB_BARVINOK) @CLANG_CPP_LIB@
+ AM_CXXFLAGS = -std=c++11
+ bin_PROGRAMS = autosa
++autosa_LDFLAGS = -Wl,--no-as-needed
+ autosa_SOURCES = \
+ 	cpu.c \
+ 	cpu.h \
+diff --git src/autosa_common.cpp src/autosa_common.cpp
+index 93fe199..ce3be4c 100644
+--- src/autosa_common.cpp
++++ src/autosa_common.cpp
+@@ -1228,7 +1228,7 @@ static isl_bool accesses_fixed_element(__isl_keep pet_expr *expr)
+   isl_bool fixed = isl_bool_true;
+ 
+   index = pet_expr_access_get_index(expr);
+-  if (index < 0)
++  if (!index)
+     return isl_bool_error;
+   n = isl_multi_pw_aff_dim(index, isl_dim_out);
+   for (i = 0; i < n; ++i)
+diff --git src/configure.ac src/configure.ac
+index 7e113f1..9664682 100644
+--- src/configure.ac
++++ src/configure.ac
+@@ -99,6 +99,19 @@ system)
+   PACKAGE_CFLAGS_PET="$PET_CFLAGS"
+ 	;;
+ esac
++dnl When using bundled pet, link autosa with libclang-cpp for LLVM 18+ (pet's undefined refs)
++CLANG_CPP_LIB=""
++if test "$with_pet" = bundled; then
++	AC_PATH_PROG([LLVM_CONFIG], [llvm-config])
++	if test -n "$LLVM_CONFIG" && test -x "$LLVM_CONFIG"; then
++		CLANG_LIBDIR=`$LLVM_CONFIG --libdir`
++		clang_cpp_path=`ls "$CLANG_LIBDIR"/libclang-cpp.so* 2>/dev/null | head -1`
++		if test -n "$clang_cpp_path" && test -f "$clang_cpp_path"; then
++			CLANG_CPP_LIB="$clang_cpp_path"
++		fi
++	fi
++fi
++AC_SUBST(CLANG_CPP_LIB)
+ 
+ # AC_SUBST(POLYBENCH_DIR)
+ # AC_SUBST(extra_tests)

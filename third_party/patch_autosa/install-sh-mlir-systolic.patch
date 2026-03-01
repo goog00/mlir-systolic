@@ -1,0 +1,22 @@
+--- a/install.sh
++++ b/install.sh
+@@ -1,17 +1,10 @@
+ #!/bin/sh
+-# Initialize ISL and PET
+-git submodule init
+-git submodule update
+-(cd src/isl; git submodule init imath; git submodule update imath)
+-(cd src/barvinok; ./get_submodules.sh)
++# Submodules already initialized by mlir-systolic (--recursive). Skip init/update.
++# ISL ppcg patch and LLVM compat patches applied by patch_autosa/apply_llvm_compat.sh.
+ 
+ # Install python packages
+ pip3 install -r requirements.txt
+ 
+-# Patch ISL
+-echo "Patch ISL"
+-(cd ./autosa_scripts/ppcg_changes/isl; ./isl_patch.sh)
+-
+ # Compilation
+ (cd src; echo "autogen"; ./autogen.sh; echo "configure"; ./configure; echo "make"; make -j4)
+ 

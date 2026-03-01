@@ -1,0 +1,359 @@
+diff --git Makefile.am Makefile.am
+index 1913558..0bcafd1 100644
+--- Makefile.am
++++ Makefile.am
+@@ -116,7 +116,8 @@ libpet_la_LDFLAGS = -version-info @versioninfo@ $(AM_LDFLAGS) $(CLANG_RFLAG)
+ libpet_la_LIBADD = -lclangFrontend -lclangParse -lclangSema \
+ 	$(LIB_CLANG_EDIT) -lclangAnalysis \
+ 	-lclangAST -lclangLex -lclangBasic -lclangDriver -lclangSerialization \
+-	$(CLANG_LIBS) $(CLANG_LDFLAGS) $(LIB_ISL)
++	-lclangASTMatchers -lclangAPINotes \
++	$(CLANG_LIBS) $(CLANG_LDFLAGS) $(LIB_ISL) $(CLANG_CPP_LIB)
+ 
+ pet_CFLAGS = $(AM_CFLAGS) @LIBYAML_CPPFLAGS@
+ pet_LDFLAGS = $(AM_LDFLAGS) @LIBYAML_LDFLAGS@
+@@ -137,15 +138,15 @@ pet_scop_cmp_SOURCES = \
+ 	pet_scop_cmp.c
+ 
+ pet_codegen_CFLAGS = $(AM_CFLAGS)
+-pet_codegen_LDFLAGS =
+-pet_codegen_LDADD = libpet.la $(LIB_ISL)
++pet_codegen_LDFLAGS = -Wl,--no-as-needed
++pet_codegen_LDADD = libpet.la $(LIB_ISL) $(CLANG_CPP_LIB)
+ pet_codegen_SOURCES = \
+ 	dummy.cc \
+ 	pet_codegen.c
+ 
+ pet_check_code_CFLAGS = $(AM_CFLAGS)
+-pet_check_code_LDFLAGS =
+-pet_check_code_LDADD = libpet.la $(LIB_ISL)
++pet_check_code_LDFLAGS = -Wl,--no-as-needed
++pet_check_code_LDADD = libpet.la $(LIB_ISL) $(CLANG_CPP_LIB)
+ pet_check_code_SOURCES = \
+ 	dummy.cc \
+ 	pet_check_code.c
+diff --git clang_compatibility.h clang_compatibility.h
+index cebdef9..f2bbd2a 100644
+--- clang_compatibility.h
++++ clang_compatibility.h
+@@ -3,7 +3,7 @@
+ 
+ #include "config.h"
+ 
+-#ifdef HAVE_BEGIN_END_LOC
++#if defined(HAVE_BEGIN_END_LOC) || (defined(__clang_major__) && __clang_major__ >= 9)
+ template <typename T>
+ inline clang::SourceLocation begin_loc(T *decl)
+ {
+diff --git id.cc id.cc
+index 0817200..6111892 100644
+--- id.cc
++++ id.cc
+@@ -141,7 +141,7 @@ static bool is_vla_with_static_size(QualType T)
+ 	if (!T->isVariableArrayType())
+ 		return false;
+ 	vlatype = cast<VariableArrayType>(T);
+-	return vlatype->getSizeModifier() == VariableArrayType::Static;
++	return vlatype->getSizeModifier() == ArraySizeModifier::Static;
+ }
+ 
+ /* Return the type of the variable represented by "id" as an array.
+diff --git m4/ax_detect_clang.m4 m4/ax_detect_clang.m4
+index f3ca119..f1975c2 100644
+--- m4/ax_detect_clang.m4
++++ m4/ax_detect_clang.m4
+@@ -3,6 +3,7 @@ AC_SUBST(CLANG_CXXFLAGS)
+ AC_SUBST(CLANG_LDFLAGS)
+ AC_SUBST(CLANG_LIBS)
+ AC_SUBST(CLANG_RFLAG)
++AC_SUBST(CLANG_CPP_LIB)
+ AX_SUBMODULE(clang,system,system)
+ if test "x$with_clang_prefix" != "x"; then
+ 	LLVM_CONFIG="$with_clang_prefix/bin/llvm-config"
+@@ -17,7 +18,16 @@ CLANG_CXXFLAGS=`$LLVM_CONFIG --cxxflags | \
+ 	     -e 's/-Wl,--no-keep-files-mapped//'`
+ CLANG_LDFLAGS=`$LLVM_CONFIG --ldflags`
+ CLANG_VERSION=`$LLVM_CONFIG --version`
++CLANG_VERSION_MAJOR=`echo "$CLANG_VERSION" | cut -d. -f1`
+ CLANG_LIB="LLVM-$CLANG_VERSION"
++CLANG_LIBDIR=`$LLVM_CONFIG --libdir`
++dnl Resolve libclang-cpp (may be versioned e.g. libclang-cpp.so.18.1)
++clang_cpp_path=`ls "$CLANG_LIBDIR"/libclang-cpp.so* 2>/dev/null | head -1`
++if test -n "$clang_cpp_path" && test -f "$clang_cpp_path"; then
++	CLANG_CPP_LIB="$clang_cpp_path"
++else
++	CLANG_CPP_LIB="-lclang-cpp"
++fi
+ 
+ SAVE_LDFLAGS="$LDFLAGS"
+ LDFLAGS="$CLANG_LDFLAGS $LDFLAGS"
+@@ -55,9 +65,16 @@ CPPFLAGS="$CLANG_CXXFLAGS $CPPFLAGS"
+ AC_LANG_PUSH(C++)
+ AC_CHECK_HEADER([clang/Basic/SourceLocation.h], [],
+ 	[AC_ERROR([clang header file not found])])
+-AC_EGREP_HEADER([getDefaultTargetTriple], [llvm/Support/Host.h], [],
++dnl LLVM 15+ moved getDefaultTargetTriple to llvm/TargetParser/Host.h
++AC_CHECK_HEADER([llvm/TargetParser/Host.h],
++	[AC_DEFINE([HAVE_LLVM_TARGETPARSER_HOST_H], [],
++	[Define if llvm/TargetParser/Host.h exists (LLVM 15+)])])
++dnl Only define getHostTriple alias for LLVM < 15 (getDefaultTargetTriple is in TargetParser in 15+)
++if test "$CLANG_VERSION_MAJOR" -lt 15 2>/dev/null; then
++  AC_EGREP_HEADER([getDefaultTargetTriple], [llvm/Support/Host.h], [],
+ 	[AC_DEFINE([getDefaultTargetTriple], [getHostTriple],
+ 	[Define to getHostTriple for older versions of clang])])
++fi
+ AC_EGREP_HEADER([getExpansionLineNumber], [clang/Basic/SourceLocation.h], [],
+ 	[AC_DEFINE([getExpansionLineNumber], [getInstantiationLineNumber],
+ 	[Define to getInstantiationLineNumber for older versions of clang])])
+@@ -112,6 +129,20 @@ AC_EGREP_HEADER([void HandleTopLevelDecl\(], [clang/AST/ASTConsumer.h],
+ AC_CHECK_HEADER([clang/Basic/DiagnosticOptions.h],
+ 	[AC_DEFINE([HAVE_BASIC_DIAGNOSTICOPTIONS_H], [],
+ 		   [Define if clang/Basic/DiagnosticOptions.h exists])])
++dnl LLVM/Clang 9+ moved DiagnosticOptions to Basic/
++if test "$CLANG_VERSION_MAJOR" -ge 9 2>/dev/null; then
++	AC_DEFINE([HAVE_BASIC_DIAGNOSTICOPTIONS_H], [], [Define for LLVM 9+])
++	AC_DEFINE([HAVE_LEX_HEADERSEARCHOPTIONS_H], [], [Define for LLVM 9+])
++	AC_DEFINE([HAVE_LEX_PREPROCESSOROPTIONS_H], [], [Define for LLVM 9+])
++	AC_DEFINE([HAVE_LLVM_OPTION_ARG_H], [], [Define for LLVM 9+])
++	AC_DEFINE([HAVE_CLANG_BASIC_LANGSTANDARD_H], [], [Define for LLVM 9+])
++fi
++if test "$CLANG_VERSION_MAJOR" -ge 15 2>/dev/null; then
++	AC_DEFINE([HAVE_LLVM_TARGETPARSER_HOST_H], [], [Define for LLVM 15+])
++	AC_DEFINE([CREATETARGETINFO_TAKES_SHARED_PTR], [], [Define for LLVM 15+])
++	AC_DEFINE([ADDPATH_TAKES_4_ARGUMENTS], [], [Define for LLVM 15+])
++	AC_DEFINE([CREATEPREPROCESSOR_TAKES_TUKIND], [], [Define for LLVM 15+])
++fi
+ AC_CHECK_HEADER([clang/Lex/HeaderSearchOptions.h],
+ 	[AC_DEFINE([HAVE_LEX_HEADERSEARCHOPTIONS_H], [],
+ 		   [Define if clang/Lex/HeaderSearchOptions.h exists])], [],
+@@ -143,13 +174,16 @@ AC_EGREP_HEADER([findLocationAfterToken], [clang/Lex/Lexer.h],
+ AC_EGREP_HEADER([translateLineCol], [clang/Basic/SourceManager.h],
+ 	[AC_DEFINE([HAVE_TRANSLATELINECOL], [],
+ 	[Define if SourceManager has translateLineCol method])])
+-AC_TRY_COMPILE([#include <clang/Frontend/CompilerInstance.h>], [
++dnl On LLVM 18 createDiagnostics(0,NULL) is ambiguous; use no-arg overload so do not define CREATEDIAGNOSTICS_TAKES_ARG
++if test "$CLANG_VERSION_MAJOR" -lt 18 2>/dev/null; then
++  AC_TRY_COMPILE([#include <clang/Frontend/CompilerInstance.h>], [
+ 	using namespace clang;
+ 	DiagnosticConsumer *client;
+ 	CompilerInstance *Clang;
+ 	Clang->createDiagnostics(client);
+ ], [], [AC_DEFINE([CREATEDIAGNOSTICS_TAKES_ARG], [],
+ 	[Define if CompilerInstance::createDiagnostics takes argc and argv])])
++fi
+ AC_TRY_COMPILE([#include <clang/Lex/HeaderSearchOptions.h>], [
+ 	using namespace clang;
+ 	HeaderSearchOptions HSO;
+@@ -208,6 +242,29 @@ AC_TRY_COMPILE([
+ 			T, PO, LangStandard::lang_unspecified);
+ ], [AC_DEFINE([SETLANGDEFAULTS_TAKES_5_ARGUMENTS], [],
+ 	[Define if CompilerInvocation::setLangDefaults takes 5 arguments])])
++dnl LLVM 18+ uses LangOptions::setLangDefaults instead of CompilerInvocation::setLangDefaults
++AC_TRY_COMPILE([
++	#include <vector>
++	#include <clang/Basic/LangOptions.h>
++	#include <clang/Basic/TargetOptions.h>
++], [
++	using namespace clang;
++	LangOptions Opts;
++	TargetOptions TO;
++	llvm::Triple T(TO.Triple);
++	std::vector<std::string> includes;
++	LangOptions::setLangDefaults(Opts, Language::C, T, includes,
++				    LangStandard::lang_unspecified);
++], [AC_DEFINE([HAVE_LANGOPTIONS_SETLANGDEFAULTS], [],
++	[Define if LangOptions::setLangDefaults exists (LLVM 18+)])])
++dnl Fallback: LLVM 18+ uses LangOptions::setLangDefaults
++if test "$CLANG_VERSION_MAJOR" -ge 18 2>/dev/null; then
++	AC_DEFINE([HAVE_LANGOPTIONS_SETLANGDEFAULTS], [], [Define for LLVM 18+])
++fi
++dnl LLVM 18+ createFileID takes FileEntryRef instead of const FileEntry*
++AC_EGREP_HEADER([createFileID\(FileEntryRef], [clang/Basic/SourceManager.h],
++	[AC_DEFINE([HAVE_CREATEFILEID_FILEENTRYREF], [],
++	[Define if SourceManager::createFileID takes FileEntryRef (LLVM 18+)])])
+ AC_TRY_COMPILE([
+ 	#include <clang/Frontend/CompilerInstance.h>
+ 	#include <clang/Frontend/CompilerInvocation.h>
+@@ -218,6 +275,10 @@ AC_TRY_COMPILE([
+ 	Clang->setInvocation(std::make_shared<CompilerInvocation>(*invocation));
+ ], [AC_DEFINE([SETINVOCATION_TAKES_SHARED_PTR], [],
+ 	[Defined if CompilerInstance::setInvocation takes a shared_ptr])])
++dnl Fallback: LLVM 15+ setInvocation takes shared_ptr
++if test "$CLANG_VERSION_MAJOR" -ge 15 2>/dev/null; then
++	AC_DEFINE([SETINVOCATION_TAKES_SHARED_PTR], [], [Define for LLVM 15+])
++fi
+ AC_TRY_COMPILE([
+ 	#include <clang/AST/Decl.h>
+ ], [
+@@ -227,6 +288,10 @@ AC_TRY_COMPILE([
+ ],
+ 	[AC_DEFINE([HAVE_BEGIN_END_LOC], [],
+ 		[Define if getBeginLoc and getEndLoc should be used])])
++dnl Fallback: LLVM/Clang 9+ use getBeginLoc/getEndLoc (getLocStart/getLocEnd removed)
++if test "$CLANG_VERSION_MAJOR" -ge 9 2>/dev/null; then
++	AC_DEFINE([HAVE_BEGIN_END_LOC], [], [Define for LLVM 9+ (getBeginLoc/getEndLoc)])
++fi
+ AC_CHECK_HEADER([llvm/Option/Arg.h],
+ 	[AC_DEFINE([HAVE_LLVM_OPTION_ARG_H], [],
+ 		   [Define if llvm/Option/Arg.h exists])])
+diff --git pet.cc pet.cc
+index da47641..8591ddb 100644
+--- pet.cc
++++ pet.cc
+@@ -49,11 +49,16 @@
+ #endif
+ #include <llvm/Support/raw_ostream.h>
+ #include <llvm/Support/ManagedStatic.h>
++#if defined(HAVE_LLVM_TARGETPARSER_HOST_H) || (defined(__has_include) && __has_include(<llvm/TargetParser/Host.h>))
++#include <llvm/TargetParser/Host.h>
++#else
+ #include <llvm/Support/Host.h>
++#endif
+ #include <clang/Basic/Version.h>
+ #include <clang/Basic/Builtins.h>
+ #include <clang/Basic/FileSystemOptions.h>
+ #include <clang/Basic/FileManager.h>
++#include <clang/Basic/LangOptions.h>
+ #include <clang/Basic/TargetOptions.h>
+ #include <clang/Basic/TargetInfo.h>
+ #include <clang/Driver/Compilation.h>
+@@ -780,7 +785,7 @@ struct MyDiagnosticPrinter : public TextDiagnosticPrinter {
+ #endif
+ 	virtual void HandleDiagnostic(DiagnosticsEngine::Level level,
+ 					const DiagnosticInfo &info) {
+-		if (info.getID() == diag::ext_implicit_function_decl &&
++		if (info.getID() == diag::warn_implicit_function_decl &&
+ 		    info.getNumArgs() >= 1 &&
+ 		    info.getArgKind(0) == DiagnosticsEngine::ak_identifierinfo &&
+ 		    is_implicit(info.getArgIdentifier(0), pencil))
+@@ -834,9 +839,9 @@ struct ClangAPI {
+  * In this case, an ArrayRef<const char *>.
+  */
+ static void create_from_args(CompilerInvocation &invocation,
+-	const ArgStringList *args, DiagnosticsEngine &Diags)
++	const llvm::opt::ArgStringList *args, DiagnosticsEngine &Diags)
+ {
+-	CompilerInvocation::CreateFromArgs(invocation, *args, Diags);
++	CompilerInvocation::CreateFromArgs(invocation, llvm::ArrayRef<const char *>(*args), Diags);
+ }
+ 
+ #else
+@@ -845,7 +850,7 @@ static void create_from_args(CompilerInvocation &invocation,
+  * In this case, two "const char *" pointers.
+  */
+ static void create_from_args(CompilerInvocation &invocation,
+-	const ArgStringList *args, DiagnosticsEngine &Diags)
++	const llvm::opt::ArgStringList *args, DiagnosticsEngine &Diags)
+ {
+ 	CompilerInvocation::CreateFromArgs(invocation, args->data() + 1,
+ 						args->data() + args->size(),
+@@ -877,7 +882,7 @@ static CompilerInvocation *construct_invocation(const char *filename,
+ 	if (strcmp(cmd->getCreator().getName(), "clang"))
+ 		return NULL;
+ 
+-	const ArgStringList *args = &cmd->getArguments();
++	const llvm::opt::ArgStringList *args = &cmd->getArguments();
+ 
+ 	CompilerInvocation *invocation = new CompilerInvocation;
+ 	create_from_args(*invocation, args, Diags);
+@@ -994,11 +999,22 @@ void add_path(HeaderSearchOptions &HSO, string Path)
+ 
+ #ifdef HAVE_SETMAINFILEID
+ 
++#ifdef HAVE_CREATEFILEID_FILEENTRYREF
++static void create_main_file_id(SourceManager &SM, FileManager &FM,
++				const char *filename)
++{
++	OptionalFileEntryRef ref = FM.getOptionalFileRef(filename);
++	if (ref)
++		SM.setMainFileID(SM.createFileID(*ref, SourceLocation(),
++						SrcMgr::C_User));
++}
++#else
+ static void create_main_file_id(SourceManager &SM, const FileEntry *file)
+ {
+ 	SM.setMainFileID(SM.createFileID(file, SourceLocation(),
+ 					SrcMgr::C_User));
+ }
++#endif
+ 
+ #else
+ 
+@@ -1020,6 +1036,18 @@ static void set_lang_defaults(CompilerInstance *Clang)
+ 					    LangStandard::lang_unspecified);
+ }
+ 
++#elif defined(HAVE_LANGOPTIONS_SETLANGDEFAULTS)
++
++static void set_lang_defaults(CompilerInstance *Clang)
++{
++	TargetOptions &TO = Clang->getTargetOpts();
++	llvm::Triple T(TO.Triple);
++	std::vector<std::string> includes;
++	LangOptions::setLangDefaults(Clang->getInvocation().getLangOpts(),
++				    Language::C, T, includes,
++				    LangStandard::lang_unspecified);
++}
++
+ #else
+ 
+ static void set_lang_defaults(CompilerInstance *Clang)
+@@ -1154,7 +1182,12 @@ static isl_stat foreach_scop_in_C_source(isl_ctx *ctx,
+ 	if (!file)
+ 		isl_die(ctx, isl_error_unknown, "unable to open file",
+ 			do { delete Clang; return isl_stat_error; } while (0));
++#ifdef HAVE_CREATEFILEID_FILEENTRYREF
++	create_main_file_id(Clang->getSourceManager(), Clang->getFileManager(),
++			   filename);
++#else
+ 	create_main_file_id(Clang->getSourceManager(), file);
++#endif
+ 
+ 	Clang->createASTContext();
+ 	PetASTConsumer consumer(ctx, PP, Clang->getASTContext(), Diags,
+diff --git scan.cc scan.cc
+index ece2b07..c7718b9 100644
+--- scan.cc
++++ scan.cc
+@@ -2712,7 +2712,7 @@ __isl_give pet_expr *PetScan::set_upper_bounds(__isl_take pet_expr *expr,
+ 	qt = qt->getCanonicalTypeInternal();
+ 	atype = cast<ArrayType>(qt.getTypePtr());
+ 
+-	if (decayed && atype->getSizeModifier() != ArrayType::Static) {
++	if (decayed && atype->getSizeModifier() != ArraySizeModifier::Static) {
+ 		qt = atype->getElementType();
+ 		return set_upper_bounds(expr, qt, pos + 1);
+ 	}
+diff --git scan.h scan.h
+index dd7f664..b6738a6 100644
+--- scan.h
++++ scan.h
+@@ -68,10 +68,11 @@ struct Independent {
+ };
+ 
+ /* Compare two TypeDecl pointers based on their names.
++ * operator() must be const for use as std::set comparator in C++11 and later.
+  */
+ struct less_name {
+ 	bool operator()(const clang::TypeDecl *x,
+-			const clang::TypeDecl *y) {
++			const clang::TypeDecl *y) const {
+ 		return x->getNameAsString().compare(y->getNameAsString()) < 0;
+ 	}
+ };
+diff --git scop_plus.h scop_plus.h
+index 99230cf..90972f6 100644
+--- scop_plus.h
++++ scop_plus.h
+@@ -9,9 +9,10 @@
+ #include "scop.h"
+ 
+ /* Compare two sequences of identifiers based on their names.
++ * operator() must be const for use as std::set comparator in C++11 and later.
+  */
+ struct array_desc_less {
+-	bool operator()(isl_id_list *x, isl_id_list *y) {
++	bool operator()(isl_id_list *x, isl_id_list *y) const {
+ 		int x_n = isl_id_list_n_id(x);
+ 		int y_n = isl_id_list_n_id(y);
+ 

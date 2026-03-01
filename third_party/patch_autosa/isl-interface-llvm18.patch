@@ -1,0 +1,16 @@
+diff --git interface/extract_interface.cc interface/extract_interface.cc
+index 388e7b6b..ce797ada 100644
+--- interface/extract_interface.cc
++++ interface/extract_interface.cc
+@@ -47,7 +47,11 @@
+ #endif
+ #include <llvm/Support/raw_ostream.h>
+ #include <llvm/Support/CommandLine.h>
++#if defined(HAVE_LLVM_TARGETPARSER_HOST_H) || (defined(__has_include) && __has_include(<llvm/TargetParser/Host.h>))
++#include <llvm/TargetParser/Host.h>
++#else
+ #include <llvm/Support/Host.h>
++#endif
+ #include <llvm/Support/ManagedStatic.h>
+ #include <clang/AST/ASTContext.h>
+ #include <clang/AST/ASTConsumer.h>

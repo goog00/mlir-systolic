@@ -1,0 +1,22 @@
+--- Makefile.am
++++ Makefile.am
+@@ -120,16 +120,16 @@ libpet_la_LIBADD = -lclangFrontend -lclangParse -lclangSema \
+ 	$(CLANG_LIBS) $(CLANG_LDFLAGS) $(LIB_ISL) $(CLANG_CPP_LIB)
+ 
+ pet_CFLAGS = $(AM_CFLAGS) @LIBYAML_CPPFLAGS@
+-pet_LDFLAGS = $(AM_LDFLAGS) @LIBYAML_LDFLAGS@
++pet_LDFLAGS = $(AM_LDFLAGS) @LIBYAML_LDFLAGS@ -Wl,--no-as-needed
+ pet_SOURCES = \
+ 	dummy.cc \
+ 	emit.c \
+ 	scop_yaml.h \
+ 	main.c
+-pet_LDADD = libpet.la $(LIB_ISL) -lyaml
++pet_LDADD = libpet.la $(LIB_ISL) -lyaml $(CLANG_CPP_LIB)
+ 
+ pet_scop_cmp_CFLAGS = $(AM_CFLAGS) @LIBYAML_CPPFLAGS@
+-pet_scop_cmp_LDFLAGS = @LIBYAML_LDFLAGS@
+-pet_scop_cmp_LDADD = libpet.la $(LIB_ISL) -lyaml
++pet_scop_cmp_LDFLAGS = @LIBYAML_LDFLAGS@ -Wl,--no-as-needed
++pet_scop_cmp_LDADD = libpet.la $(LIB_ISL) -lyaml $(CLANG_CPP_LIB)
+ pet_scop_cmp_SOURCES = \
