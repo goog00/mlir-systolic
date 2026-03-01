@@ -1,0 +1,19 @@
+--- autogen.sh
++++ autogen.sh
+@@ -1,5 +1,17 @@
+ #!/bin/sh
+-autoreconf -i --no-recursive
++ensure_ltmain() {
++	test -f ../ltmain.sh && cp -n ../ltmain.sh . 2>/dev/null || true
++	test -f ../build/ltmain.sh && cp -n ../build/ltmain.sh . 2>/dev/null || true
++	libtoolize --install --copy 2>/dev/null || true
++	test -d parker && test -f ./ltmain.sh && cp -n ./ltmain.sh parker/ 2>/dev/null || true
++}
++ensure_ltmain
++if ! autoreconf -i --no-recursive 2>/dev/null; then
++	ensure_ltmain
++	autoreconf -i --no-recursive
++fi
+ if test -f polylib/autogen.sh; then
+ 	(cd polylib; ./autogen.sh)
+ fi

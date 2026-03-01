@@ -1,0 +1,14 @@
+--- autogen.sh
++++ autogen.sh
+@@ -1,5 +1,12 @@
+ #!/bin/sh
+ autoreconf -i
+ test -f build/ltmain.sh && cp -n build/ltmain.sh . 2>/dev/null || true
++# Pre-seed barvinok (and parker) with ltmain.sh so their autoreconf finds it on first run
++if test -f ./ltmain.sh && test -d barvinok; then
++	cp -n ./ltmain.sh barvinok/ 2>/dev/null || true
++	test -d barvinok/parker && cp -n ./ltmain.sh barvinok/parker/ 2>/dev/null || true
++fi
+ if test -f isl/autogen.sh; then
+ 	(cd isl; ./autogen.sh)
+ fi

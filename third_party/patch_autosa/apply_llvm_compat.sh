@@ -89,4 +89,35 @@ if [ -f "$PATCHES_DIR/requirements-txt-scikit-learn.patch" ]; then
 	fi
 fi
 
+# 6) src/autogen.sh：首次 autoreconf 后把 build/ltmain.sh 复制到 src/，供 barvinok 等子目录的 libtoolize 使用（避免 required file './ltmain.sh' not found）
+if [ -f "$PATCHES_DIR/autogen-sh-ltmain.patch" ]; then
+	echo "=== Patching src/autogen.sh (ltmain for subdirs) ==="
+	if patch -p0 -d "$AUTOSA_ROOT/src" --forward --dry-run < "$PATCHES_DIR/autogen-sh-ltmain.patch" 2>/dev/null; then
+		patch -p0 -d "$AUTOSA_ROOT/src" --forward < "$PATCHES_DIR/autogen-sh-ltmain.patch"
+		echo "  OK."
+	else
+		echo "  Skip or already applied."
+	fi
+fi
+
+# 7) isl/barvinok autogen.sh：在 autoreconf 前先运行 libtoolize，确保 ./ltmain.sh 存在，避免第一次 autogen 失败需跑两遍
+if [ -f "$PATCHES_DIR/isl-autogen-libtoolize.patch" ] && [ -d "$AUTOSA_ROOT/src/isl" ]; then
+	echo "=== Patching src/isl/autogen.sh (libtoolize first) ==="
+	if patch -p0 -d "$AUTOSA_ROOT/src/isl" --forward --dry-run < "$PATCHES_DIR/isl-autogen-libtoolize.patch" 2>/dev/null; then
+		patch -p0 -d "$AUTOSA_ROOT/src/isl" --forward < "$PATCHES_DIR/isl-autogen-libtoolize.patch"
+		echo "  OK."
+	else
+		echo "  Skip or already applied."
+	fi
+fi
+if [ -f "$PATCHES_DIR/barvinok-autogen.patch" ] && [ -d "$AUTOSA_ROOT/src/barvinok" ]; then
+	echo "=== Patching src/barvinok/autogen.sh (ltmain + libtoolize for one-pass autogen) ==="
+	if patch -p0 -d "$AUTOSA_ROOT/src/barvinok" --forward --dry-run < "$PATCHES_DIR/barvinok-autogen.patch" 2>/dev/null; then
+		patch -p0 -d "$AUTOSA_ROOT/src/barvinok" --forward < "$PATCHES_DIR/barvinok-autogen.patch"
+		echo "  OK."
+	else
+		echo "  Skip or already applied."
+	fi
+fi
+
 echo "=== Done. You can now run install.sh or: (cd $AUTOSA_ROOT/src && ./autogen.sh && ./configure && make -j4) ==="

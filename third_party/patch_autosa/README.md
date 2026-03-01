@@ -20,6 +20,11 @@
 | `src-llvm18.patch` | 对 **顶层 src** 的修改：`configure.ac` 中在 bundled pet 时检测并导出 `CLANG_CPP_LIB`；`Makefile.am` 中为 autosa 增加 `@CLANG_CPP_LIB@` 与 `-Wl,--no-as-needed`；`autosa_common.cpp` 中 `index < 0` 改为 `!index`（指针判空） |
 | `install-sh-mlir-systolic.patch` | 修改 **install.sh**：去掉子模块 init/update 与「Patch ISL」步骤，适配先打补丁再 install 的流程 |
 | `requirements-txt-scikit-learn.patch` | 修改 **requirements.txt**：`sklearn>=0.0` 改为 `scikit-learn>=0.0`（PyPI 包名已变更） |
+| `autogen-sh-ltmain.patch` | 修改 **src/autogen.sh**：在首次 `autoreconf -i` 后把 `build/ltmain.sh` 复制到 `src/`，并**在调用 barvinok 前**把 `ltmain.sh` 预复制到 `barvinok/` 与 `barvinok/parker/`，这样 barvinok 的 autoreconf 第一次就能找到 `./ltmain.sh`，单次 autogen 即可成功，无需跑两遍 |
+| `isl-autogen-libtoolize.patch` | 修改 **src/isl/autogen.sh**：在 `autoreconf` 前先运行 `libtoolize --install --copy`，确保一次 autogen 即可成功 |
+| `barvinok-autogen.patch` | 修改 **src/barvinok/autogen.sh**：先准备 `ltmain.sh`（从 `../` 或 `../build/` 复制 + `libtoolize`），复制到 **parker**，再运行 `autoreconf`；若首次失败则再次准备并重跑一次，避免 `required file './ltmain.sh' not found`，保证单次执行 autogen 即可成功 |
+
+以上补丁均为必要：pet/isl/src 为 LLVM 18 兼容，install/requirements 为流程与依赖，autogen 相关三份解决 ltmain.sh 与一次生成 configure 的问题。
 
 ## 使用方式
 
