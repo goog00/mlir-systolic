@@ -1,14 +1,39 @@
 --- autogen.sh
 +++ autogen.sh
-@@ -1,5 +1,12 @@
+@@ -1,8 +1,36 @@
  #!/bin/sh
- autoreconf -i
- test -f build/ltmain.sh && cp -n build/ltmain.sh . 2>/dev/null || true
-+# Pre-seed barvinok (and parker) with ltmain.sh so their autoreconf finds it on first run
-+if test -f ./ltmain.sh && test -d barvinok; then
-+	cp -n ./ltmain.sh barvinok/ 2>/dev/null || true
-+	test -d barvinok/parker && cp -n ./ltmain.sh barvinok/parker/ 2>/dev/null || true
++# Use repo root ltmain.sh (official AutoSA ships it) so one autogen suffices
++if test -f ../ltmain.sh; then
++	cp -f ../ltmain.sh .
++	test -d build || mkdir -p build
++	cp -f ../ltmain.sh build/ 2>/dev/null || true
 +fi
++# Pre-seed barvinok (and parker) BEFORE autoreconf -i: automake recurses into SUBDIRS (barvinok) and needs ltmain.sh there
++if test -d barvinok; then
++	if test -f ./ltmain.sh; then
++		cp -f ./ltmain.sh barvinok/
++		test -d barvinok/parker && cp -f ./ltmain.sh barvinok/parker/
++	elif test -f build/ltmain.sh; then
++		cp -f build/ltmain.sh barvinok/
++		test -d barvinok/parker && cp -f build/ltmain.sh barvinok/parker/
++	fi
++fi
+ autoreconf -i
++test -f build/ltmain.sh && cp -n build/ltmain.sh . 2>/dev/null || true
  if test -f isl/autogen.sh; then
  	(cd isl; ./autogen.sh)
+ fi
++# Ensure barvinok (and parker) have ltmain before barvinok/autogen: try ., build/, then repo root ../
++if test -d barvinok; then
++	lt_src=""
++	test -f ./ltmain.sh && lt_src=./ltmain.sh
++	test -z "$lt_src" && test -f build/ltmain.sh && lt_src=build/ltmain.sh
++	test -z "$lt_src" && test -f ../ltmain.sh && lt_src=../ltmain.sh
++	if test -n "$lt_src"; then
++		cp -f "$lt_src" barvinok/ 2>/dev/null || true
++		test -d barvinok/parker && cp -f "$lt_src" barvinok/parker/ 2>/dev/null || true
++	fi
++fi
+ if test -f barvinok/autogen.sh; then
+   (cd barvinok; ./autogen.sh)
  fi

@@ -1,6 +1,6 @@
 --- autogen.sh
 +++ autogen.sh
-@@ -1,5 +1,17 @@
+@@ -1,12 +1,22 @@
  #!/bin/sh
 -autoreconf -i --no-recursive
 +ensure_ltmain() {
@@ -16,4 +16,10 @@
 +fi
  if test -f polylib/autogen.sh; then
  	(cd polylib; ./autogen.sh)
+ fi
+ if test -f isl/autogen.sh; then
+ 	(cd isl; ./autogen.sh)
+ fi
+ if test -f pet/autogen.sh; then
+ 	(cd pet; ./autogen.sh)
  fi
