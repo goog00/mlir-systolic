@@ -21,6 +21,12 @@
 ### 📊 项目状态
 - **[status/PROJECT_STATUS.md](status/PROJECT_STATUS.md)** — 当前状态
 - **[status/ROADMAP.md](status/ROADMAP.md)** — 技术路线图
+- **[status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md](status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md)** — 实现状态与下一步
+
+### 🎯 设计策略
+- **[design/SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md](design/SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md)** — 单核快速验证（HLS≤2h）、多核共用参数求取、单核高性能模板（相对 AutoSA）
+- **[design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md](design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md)** — 脉动阵列优化改进计划（多种优化手段；参数依多面体分析选择范围；MTTKRP/TTMc、MM/CNN 分阶段）
+- **[design/EXISTING_OPTIMIZATIONS_IN_CODE.md](design/EXISTING_OPTIMIZATIONS_IN_CODE.md)** — 代码中已有的优化方法梳理（写时重排、L2/L3 接入点、FIFO、reduction 等）
 
 ---
 
@@ -91,7 +97,11 @@ docs/
 │
 ├── status/                                      # 项目状态
 │   ├── PROJECT_STATUS.md                        # 当前状态
-│   └── ROADMAP.md                               # 路线图
+│   ├── ROADMAP.md                               # 路线图
+│   └── CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md # 实现与下一步
+│
+├── design/                                      # 设计策略
+│   └── SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md  # 单/多核与高性能策略
 │
 ├── reference/                                   # 参考资料
 │   ├── autosa/                                  # AutoSA参考

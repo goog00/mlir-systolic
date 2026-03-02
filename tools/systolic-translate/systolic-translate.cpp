@@ -22,6 +22,7 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -31,6 +32,8 @@
 #include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
+
+#define DEBUG_TYPE "systolic-translate"
 
 //===----------------------------------------------------------------------===//
 // Command Line Options
@@ -128,6 +131,11 @@ private:
   // 写时重排信息：存储所有数组的重排信息
   std::unordered_map<std::string, ArrayReorderingInfo> arrayReordering;
   
+  // 从 kernel 函数参数推导的数组名：2 个输入 + 1 个输出（如 MM: A,B,C；MTTKRP: A,B,D）
+  SmallVector<std::string, 2> inputNames;
+  std::string outputName;
+  void deriveArrayNamesFromFunction(func::FuncOp funcOp);
+  
   // Indentation helpers
   raw_ostream &indent() { indentLevel++; return os; }
   raw_ostream &dedent() { if (indentLevel > 0) indentLevel--; return os; }
@@ -146,6 +154,15 @@ private:
   SmallVector<std::string, 3> applyAccessPermutation(
       StringRef arrayName,
       const SmallVector<std::string, 3> &originalIndices) const;
+  /// True if array has 2D reordering (for drain serialize write-time reorder).
+  bool hasReordering2D(StringRef arrayName) const;
+  /// Linear index in original layout from reordered (d0,d1). sizeLiteral used in expr (0 => "size").
+  std::string getLinearIndexFromReordered2D(StringRef arrayName,
+                                           StringRef d0Var, StringRef d1Var,
+                                           unsigned sizeLiteral) const;
+  /// Original index exprs [orig0, orig1] from (d0,d1) for buffer[orig0][orig1].
+  SmallVector<std::string, 2> getOriginalIndexExprs2D(StringRef arrayName,
+                                                      StringRef d0Var, StringRef d1Var) const;
   
   // Emission methods
   void emitFileHeader();
@@ -206,83 +223,79 @@ void SystolicHLSEmitter::emitFileHeader() {
   os << "#define max(x,y) ((x > y) ? x : y)\n\n";
 }
 
+void SystolicHLSEmitter::deriveArrayNamesFromFunction(func::FuncOp funcOp) {
+  inputNames.clear();
+  outputName = "C";
+  SmallVector<std::string, 4> names;
+  for (unsigned i = 0; i < funcOp.getNumArguments(); i++) {
+    if (!funcOp.getArgument(i).getType().isa<MemRefType>()) continue;
+    if (auto attr = funcOp.getArgAttrOfType<StringAttr>(i, "mlir.name"))
+      names.push_back(attr.getValue().str());
+    else
+      names.push_back("arg" + std::to_string(i));
+  }
+  if (names.size() >= 3) {
+    inputNames.push_back(names[0]);
+    inputNames.push_back(names[1]);
+    outputName = names[2];
+  } else {
+    inputNames.push_back("A");
+    inputNames.push_back("B");
+  }
+}
+
 void SystolicHLSEmitter::emitTypeDefinitions() {
   os << "/* Data Type */\n";
-  os << "typedef float A_t1;\n";
-  os << "typedef float B_t1;\n";
-  os << "typedef float C_t1;\n";
-  
-  // Packed types based on array_part
-  unsigned packBits = arrayPart * 32;
-  os << "typedef ap_uint<512> A_t16;\n";
-  os << "typedef ap_uint<" << (arrayPart * 32) << "> A_t" << arrayPart << ";\n";
-  os << "typedef ap_uint<512> B_t16;\n";
-  os << "typedef ap_uint<" << (arrayPart * 32) << "> B_t" << arrayPart << ";\n";
-  os << "typedef ap_uint<512> C_t16;\n";
-  os << "typedef ap_uint<" << (latency * 32) << "> C_t" << latency << ";\n";
+  for (const auto &n : inputNames) {
+    os << "typedef float " << n << "_t1;\n";
+    os << "typedef ap_uint<512> " << n << "_t16;\n";
+    os << "typedef ap_uint<" << (arrayPart * 32) << "> " << n << "_t" << arrayPart << ";\n";
+  }
+  os << "typedef float " << outputName << "_t1;\n";
+  os << "typedef ap_uint<512> " << outputName << "_t16;\n";
+  os << "typedef ap_uint<" << (latency * 32) << "> " << outputName << "_t" << latency << ";\n";
   os << "/* Data Type */\n\n";
 }
 
 void SystolicHLSEmitter::emitModuleDeclarations() {
   os << "/* Module Declarations */\n";
-    os << "void A_IO_L3_in(hls::stream<A_t" << arrayPart << "> &fifo_A_in, "
-      << "hls::stream<A_t" << arrayPart << "> &fifo_A_local_out);\n";
-  os << "void A_IO_L3_in_serialize(A_t16 *A, hls::stream<A_t" << arrayPart 
-     << "> &fifo_A_local_out);\n";
-  os << "void A_IO_L2_in_intra_trans(int idx, int c0, int c1, int c2, A_t" << arrayPart 
-     << " local_A[" << latency << "][1], hls::stream<float> &fifo_A_local_out, bool intra_trans_en);\n";
-  os << "void A_IO_L2_in_inter_trans(int idx, int c0, int c1, int c2, A_t" << arrayPart 
-     << " local_A[" << latency << "][1], hls::stream<A_t" << arrayPart 
-     << "> &fifo_A_in, hls::stream<A_t" << arrayPart << "> &fifo_A_out, bool inter_trans_en);\n";
-  os << "void A_IO_L2_in_inter_trans_boundary(int idx, int c0, int c1, int c2, A_t" << arrayPart 
-     << " local_A[" << latency << "][1], hls::stream<A_t" << arrayPart << "> &fifo_A_in, bool inter_trans_en);\n";
-  os << "void A_IO_L2_in(int idx, hls::stream<A_t" << arrayPart << "> &fifo_A_in, "
-     << "hls::stream<A_t" << arrayPart << "> &fifo_A_out, "
-     << "hls::stream<float> &fifo_A_local_out);\n";
-  os << "void A_IO_L2_in_boundary(int idx, hls::stream<A_t" << arrayPart 
-     << "> &fifo_A_in, hls::stream<float> &fifo_A_local_out);\n";
-  os << "void B_IO_L3_in(hls::stream<B_t" << arrayPart << "> &fifo_B_in, "
-     << "hls::stream<B_t" << arrayPart << "> &fifo_B_local_out);\n";
-  os << "void B_IO_L3_in_serialize(B_t16 *B, hls::stream<B_t" << arrayPart 
-     << "> &fifo_B_local_out);\n";
-  os << "void B_IO_L2_in_intra_trans(int idx, int c0, int c1, int c2, B_t" << arrayPart 
-     << " local_B[" << latency << "][1], hls::stream<float> &fifo_B_local_out, bool intra_trans_en);\n";
-  os << "void B_IO_L2_in_inter_trans(int idx, int c0, int c1, int c2, B_t" << arrayPart 
-     << " local_B[" << latency << "][1], hls::stream<B_t" << arrayPart 
-     << "> &fifo_B_in, hls::stream<B_t" << arrayPart << "> &fifo_B_out, bool inter_trans_en);\n";
-  os << "void B_IO_L2_in_inter_trans_boundary(int idx, int c0, int c1, int c2, B_t" << arrayPart 
-     << " local_B[" << latency << "][1], hls::stream<B_t" << arrayPart << "> &fifo_B_in, bool inter_trans_en);\n";
-  os << "void B_IO_L2_in(int idx, hls::stream<B_t" << arrayPart << "> &fifo_B_in, "
-     << "hls::stream<B_t" << arrayPart << "> &fifo_B_out, "
-     << "hls::stream<float> &fifo_B_local_out);\n";
-  os << "void B_IO_L2_in_boundary(int idx, hls::stream<B_t" << arrayPart 
-     << "> &fifo_B_in, hls::stream<float> &fifo_B_local_out);\n";
+  for (const auto &name : inputNames) {
+    os << "void " << name << "_IO_L3_in(hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_in, "
+       << "hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_local_out);\n";
+    os << "void " << name << "_IO_L3_in_serialize(" << name << "_t16 *" << name << ", hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_local_out);\n";
+    os << "void " << name << "_IO_L2_in_intra_trans(int idx, int c0, int c1, int c2, " << name << "_t" << arrayPart
+       << " local_" << name << "[" << latency << "][1], hls::stream<float> &fifo_" << name << "_local_out, bool intra_trans_en);\n";
+    os << "void " << name << "_IO_L2_in_inter_trans(int idx, int c0, int c1, int c2, " << name << "_t" << arrayPart
+       << " local_" << name << "[" << latency << "][1], hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_in, hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_out, bool inter_trans_en);\n";
+    os << "void " << name << "_IO_L2_in_inter_trans_boundary(int idx, int c0, int c1, int c2, " << name << "_t" << arrayPart
+       << " local_" << name << "[" << latency << "][1], hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_in, bool inter_trans_en);\n";
+    os << "void " << name << "_IO_L2_in(int idx, hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_in, "
+       << "hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_out, "
+       << "hls::stream<float> &fifo_" << name << "_local_out);\n";
+    os << "void " << name << "_IO_L2_in_boundary(int idx, hls::stream<" << name << "_t" << arrayPart << "> &fifo_" << name << "_in, hls::stream<float> &fifo_" << name << "_local_out);\n";
+  }
   os << "void PE_wrapper(int idx, int idy, "
-     << "hls::stream<float> &fifo_A_in, hls::stream<float> &fifo_A_out, "
-     << "hls::stream<float> &fifo_B_in, hls::stream<float> &fifo_B_out, "
-     << "hls::stream<float> &fifo_C_drain_out);\n";
-  os << "void C_drain_IO_L1_out_intra_trans(int idx, int idy, int c0, int c1, C_t" << latency 
-     << " local_C[" << latency << "][1], hls::stream<float> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L1_out_inter_trans(int idx, int idy, int c0, int c1, C_t" << latency 
-     << " local_C[" << latency << "][1], hls::stream<C_t" << latency 
-     << "> &fifo_C_drain_in, hls::stream<C_t" << latency << "> &fifo_C_drain_out);\n";
-  os << "void C_drain_IO_L1_out_inter_trans_boundary(int idx, int idy, int c0, int c1, C_t" << latency 
-     << " local_C[" << latency << "][1], hls::stream<C_t" << latency << "> &fifo_C_drain_out);\n";
-  os << "void C_drain_IO_L1_out_wrapper(int idx, int idy, "
-     << "hls::stream<C_t" << latency << "> &fifo_C_drain_in, "
-     << "hls::stream<C_t" << latency << "> &fifo_C_drain_out, "
-     << "hls::stream<float> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L1_out_boundary_wrapper(int idx, int idy, "
-     << "hls::stream<C_t" << latency << "> &fifo_C_drain_out, "
-     << "hls::stream<float> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L2_out(int idx, hls::stream<C_t" << latency 
-     << "> &fifo_C_drain_in, hls::stream<C_t" << latency 
-     << "> &fifo_C_drain_out, hls::stream<C_t" << latency << "> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L2_out_boundary(int idx, hls::stream<C_t" << latency 
-     << "> &fifo_C_drain_out, hls::stream<C_t" << latency << "> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L3_out(hls::stream<C_t" << latency 
-     << "> &fifo_C_drain_out, hls::stream<C_t" << latency << "> &fifo_C_drain_local_in);\n";
-  os << "void C_drain_IO_L3_out_serialize(C_t16 *C, hls::stream<C_t" << latency << "> &fifo_C_drain_local_in);\n";
+     << "hls::stream<float> &fifo_" << inputNames[0] << "_in, hls::stream<float> &fifo_" << inputNames[0] << "_out, "
+     << "hls::stream<float> &fifo_" << inputNames[1] << "_in, hls::stream<float> &fifo_" << inputNames[1] << "_out, "
+     << "hls::stream<float> &fifo_" << outputName << "_drain_out);\n";
+  os << "void " << outputName << "_drain_IO_L1_out_intra_trans(int idx, int idy, int c0, int c1, " << outputName << "_t" << latency
+     << " local_" << outputName << "[" << latency << "][1], hls::stream<float> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L1_out_inter_trans(int idx, int idy, int c0, int c1, " << outputName << "_t" << latency
+     << " local_" << outputName << "[" << latency << "][1], hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_in, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out);\n";
+  os << "void " << outputName << "_drain_IO_L1_out_inter_trans_boundary(int idx, int idy, int c0, int c1, " << outputName << "_t" << latency
+     << " local_" << outputName << "[" << latency << "][1], hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out);\n";
+  os << "void " << outputName << "_drain_IO_L1_out_wrapper(int idx, int idy, "
+     << "hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_in, "
+     << "hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out, "
+     << "hls::stream<float> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L1_out_boundary_wrapper(int idx, int idy, "
+     << "hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out, "
+     << "hls::stream<float> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L2_out(int idx, hls::stream<" << outputName << "_t" << latency
+     << "> &fifo_" << outputName << "_drain_in, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L2_out_boundary(int idx, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L3_out(hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_out, hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_local_in);\n";
+  os << "void " << outputName << "_drain_IO_L3_out_serialize(" << outputName << "_t16 *" << outputName << ", hls::stream<" << outputName << "_t" << latency << "> &fifo_" << outputName << "_drain_local_in);\n";
   os << "/* Module Declarations */\n\n";
 }
 
@@ -294,21 +307,52 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
      << "_t16 *" << arrayName << ", hls::stream<" << arrayName << "_t" 
      << arrayPart << "> &fifo_" << arrayName << "_local_out) {\n";
   os << "#pragma HLS INLINE OFF\n";
-  os << "  /* Variable Declaration */\n";
-  os << "  " << arrayName << "_t" << arrayPart << " fifo_data;\n";
-  os << "  " << arrayName << "_t16 mem_data;\n";
-  
-  unsigned iterations = (totalSize * totalSize * 4) / 64;  // 512 bits = 64 bytes
-  os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " 
-     << iterations << "; i++) {\n";
-  os << "  #pragma HLS PIPELINE II=1\n";
-  os << "    mem_data = " << arrayName << "[i];\n";
-  os << "    for (ap_uint<2> p = 0; p < 2; p++) {\n";
-  os << "      fifo_data = mem_data(" << (arrayPart * 32 - 1) << ", 0);\n";
-  os << "      mem_data = mem_data >> " << (arrayPart * 32) << ";\n";
-  os << "      fifo_" << arrayName << "_local_out.write(fifo_data);\n";
-  os << "    }\n";
-  os << "  }\n";
+
+  if (hasReordering2D(arrayName)) {
+    // Read-time reordering: iterate (d0,d1) in reordered layout order; DRAM read is still
+    // sequential (word_idx = reordered_linear/16). Assumes input is in reordered layout.
+    unsigned loopBits = (unsigned)ceil(log2(totalSize + 1));
+    os << "  /* Read in reordered dimension order (input assumed reordered layout) */\n";
+    os << "  " << arrayName << "_t16 current_word;\n";
+    os << "  union { float f; uint32_t u; } tmp;\n";
+    os << "  float buf[" << arrayPart << "];\n";
+    os << "  #pragma HLS ARRAY_PARTITION variable=buf complete\n";
+    os << "  unsigned reordered_linear, word_idx, offset;\n";
+    os << "  int count = 0;\n";
+    os << "  for (ap_uint<" << loopBits << "> d0 = 0; d0 < " << totalSize << "; d0++)\n";
+    os << "    for (ap_uint<" << loopBits << "> d1 = 0; d1 < " << totalSize << "; d1++) {\n";
+    os << "      reordered_linear = d0 * " << totalSize << " + d1;\n";
+    os << "      word_idx = reordered_linear >> 4;\n";
+    os << "      offset = reordered_linear & 15;\n";
+    os << "      if (offset == 0) current_word = " << arrayName << "[word_idx];\n";
+    os << "      tmp.u = current_word.range(32*(int)(offset+1)-1, 32*(int)offset).to_uint();\n";
+    os << "      buf[count++] = tmp.f;\n";
+    os << "      if (count == " << arrayPart << ") {\n";
+    os << "        " << arrayName << "_t" << arrayPart << " fifo_data;\n";
+    os << "        for (int i = 0; i < " << arrayPart << "; i++) {\n";
+    os << "          tmp.f = buf[i];\n";
+    os << "          fifo_data.range(32*(i+1)-1, 32*i) = tmp.u;\n";
+    os << "        }\n";
+    os << "        fifo_" << arrayName << "_local_out.write(fifo_data);\n";
+    os << "        count = 0;\n";
+    os << "      }\n";
+    os << "    }\n";
+  } else {
+    os << "  /* Variable Declaration */\n";
+    os << "  " << arrayName << "_t" << arrayPart << " fifo_data;\n";
+    os << "  " << arrayName << "_t16 mem_data;\n";
+    unsigned iterations = (totalSize * totalSize * 4) / 64;  // 512 bits = 64 bytes
+    os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " 
+       << iterations << "; i++) {\n";
+    os << "  #pragma HLS PIPELINE II=1\n";
+    os << "    mem_data = " << arrayName << "[i];\n";
+    os << "    for (ap_uint<2> p = 0; p < 2; p++) {\n";
+    os << "      fifo_data = mem_data(" << (arrayPart * 32 - 1) << ", 0);\n";
+    os << "      mem_data = mem_data >> " << (arrayPart * 32) << ";\n";
+    os << "      fifo_" << arrayName << "_local_out.write(fifo_data);\n";
+    os << "    }\n";
+    os << "  }\n";
+  }
   os << "}\n";
   os << "/* Module Definition */\n\n";
 }
@@ -634,45 +678,36 @@ void SystolicHLSEmitter::emitIOL2InBoundary(StringRef arrayName) {
 }
 
 void SystolicHLSEmitter::emitPE() {
-  // c5 bound: arrayPart / simd = 8 / 1 = 8 iterations (0 to 7)
   unsigned c5Bound = arrayPart / simd;
-  
+  const std::string &in0 = inputNames[0], &in1 = inputNames[1], &out = outputName;
   os << "/* Module Definition */\n";
   os << "void PE(int idx, int idy, "
-     << "hls::stream<float> &fifo_A_in, hls::stream<float> &fifo_A_out, "
-     << "hls::stream<float> &fifo_B_in, hls::stream<float> &fifo_B_out, "
-     << "hls::stream<float> &fifo_C_drain_out) {\n";
+     << "hls::stream<float> &fifo_" << in0 << "_in, hls::stream<float> &fifo_" << in0 << "_out, "
+     << "hls::stream<float> &fifo_" << in1 << "_in, hls::stream<float> &fifo_" << in1 << "_out, "
+     << "hls::stream<float> &fifo_" << out << "_drain_out) {\n";
   os << "#pragma HLS INLINE OFF\n";
-  os << "  /* Variable Declaration */\n";
-  os << "  int p0 = idx, p1 = idy; // module id\n";
-  os << "  A_t1 local_A[1][1];\n";
-  os << "  #pragma HLS ARRAY_PARTITION variable=local_A dim=0 complete\n";
-  os << "  B_t1 local_B[1][1];\n";
-  os << "  #pragma HLS ARRAY_PARTITION variable=local_B dim=0 complete\n";
-  os << "  C_t1 local_C[" << latency << "][" << latency << "];\n";
-  os << "  #pragma HLS RESOURCE variable=local_C core=RAM_2P_BRAM\n";
-  os << "  /* Variable Declaration */\n\n";
-  
-  // Main computation loops - c0, c1, c2 iterate over numTiles
+  os << "  int p0 = idx, p1 = idy;\n";
+  os << "  " << in0 << "_t1 local_" << in0 << "[1][1];\n";
+  os << "  #pragma HLS ARRAY_PARTITION variable=local_" << in0 << " dim=0 complete\n";
+  os << "  " << in1 << "_t1 local_" << in1 << "[1][1];\n";
+  os << "  #pragma HLS ARRAY_PARTITION variable=local_" << in1 << " dim=0 complete\n";
+  os << "  " << out << "_t1 local_" << out << "[" << latency << "][" << latency << "];\n";
+  os << "  #pragma HLS RESOURCE variable=local_" << out << " core=RAM_2P_BRAM\n";
   os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
   os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
   os << "      for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
-  os << "        // array\n";
-  os << "        // pe\n";
   os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1) {\n";
-  os << "          // latency\n";
   os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1) {\n";
-  os << "            // latency\n";
   os << "            for (ap_uint<3> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
   os << "            #pragma HLS PIPELINE II=1\n";
   os << "              {\n";
-  os << "                local_A[0][0] = fifo_A_in.read();\n";
-  os << "                local_B[0][0] = fifo_B_in.read();\n";
-  os << "                local_C[c7][c6] = (local_C[c7][c6] + (local_A[0][0] * local_B[0][0]));\n";
+  os << "                local_" << in0 << "[0][0] = fifo_" << in0 << "_in.read();\n";
+  os << "                local_" << in1 << "[0][0] = fifo_" << in1 << "_in.read();\n";
+  os << "                local_" << out << "[c7][c6] = (local_" << out << "[c7][c6] + (local_" << in0 << "[0][0] * local_" << in1 << "[0][0]));\n";
   os << "                if (c2 == " << (numTiles - 1) << " && c5 == " << (c5Bound - 1) << ")\n";
-  os << "                  fifo_C_drain_out.write(local_C[c7][c6]);\n";
-  os << "                fifo_B_out.write(local_B[0][0]);\n";
-  os << "                fifo_A_out.write(local_A[0][0]);\n";
+  os << "                  fifo_" << out << "_drain_out.write(local_" << out << "[c7][c6]);\n";
+  os << "                fifo_" << in1 << "_out.write(local_" << in1 << "[0][0]);\n";
+  os << "                fifo_" << in0 << "_out.write(local_" << in0 << "[0][0]);\n";
   os << "              }\n";
   os << "            }\n";
   os << "          }\n";
@@ -683,68 +718,47 @@ void SystolicHLSEmitter::emitPE() {
 }
 
 void SystolicHLSEmitter::emitPEWrapper() {
+  const std::string &in0 = inputNames[0], &in1 = inputNames[1], &out = outputName;
   os << "/* Module Definition */\n";
   os << "void PE_wrapper(int idx, int idy, "
-     << "hls::stream<float> &fifo_A_in, hls::stream<float> &fifo_A_out, "
-     << "hls::stream<float> &fifo_B_in, hls::stream<float> &fifo_B_out, "
-     << "hls::stream<float> &fifo_C_drain_out) {\n";
-  os << "  PE(idx, idy, fifo_A_in, fifo_A_out, fifo_B_in, fifo_B_out, "
-     << "fifo_C_drain_out);\n";
+     << "hls::stream<float> &fifo_" << in0 << "_in, hls::stream<float> &fifo_" << in0 << "_out, "
+     << "hls::stream<float> &fifo_" << in1 << "_in, hls::stream<float> &fifo_" << in1 << "_out, "
+     << "hls::stream<float> &fifo_" << out << "_drain_out) {\n";
+  os << "  PE(idx, idy, fifo_" << in0 << "_in, fifo_" << in0 << "_out, fifo_" << in1 << "_in, fifo_" << in1 << "_out, fifo_" << out << "_drain_out);\n";
   os << "}\n";
   os << "/* Module Definition */\n\n";
 }
 
 void SystolicHLSEmitter::emitDummyModules() {
   unsigned c5Bound = arrayPart / simd;
-  
-  // A dummy module
+  const std::string &in0 = inputNames[0], &in1 = inputNames[1];
   os << "/* Module Definition */\n";
-  os << "void A_PE_dummy_in(int idx, int idy, hls::stream<float> &fifo_A_in) {\n";
-  os << "  /* Variable Declaration */\n";
-  os << "  int p0 = idx, p1 = idy; // module id\n";
-  os << "  /* Variable Declaration */\n\n";
+  os << "void " << in0 << "_PE_dummy_in(int idx, int idy, hls::stream<float> &fifo_" << in0 << "_in) {\n";
+  os << "  int p0 = idx, p1 = idy;\n";
   os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
   os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
   os << "      for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
-  os << "        // array\n";
-  os << "        // pe\n";
-  os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1) {\n";
-  os << "          // latency\n";
-  os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1) {\n";
-  os << "            // latency\n";
+  os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1)\n";
+  os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1)\n";
   os << "            for (ap_uint<3> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
   os << "            #pragma HLS PIPELINE II=1\n";
-  os << "              A_t1 fifo_data;\n";
-  os << "              fifo_data = fifo_A_in.read();\n";
+  os << "              " << in0 << "_t1 fifo_data; fifo_data = fifo_" << in0 << "_in.read();\n";
   os << "            }\n";
-  os << "          }\n";
-  os << "        }\n";
   os << "      }\n";
   os << "}\n";
   os << "/* Module Definition */\n\n";
-  
-  // B dummy module
   os << "/* Module Definition */\n";
-  os << "void B_PE_dummy_in(int idx, int idy, hls::stream<float> &fifo_B_in) {\n";
-  os << "  /* Variable Declaration */\n";
-  os << "  int p0 = idx, p1 = idy; // module id\n";
-  os << "  /* Variable Declaration */\n\n";
+  os << "void " << in1 << "_PE_dummy_in(int idx, int idy, hls::stream<float> &fifo_" << in1 << "_in) {\n";
+  os << "  int p0 = idx, p1 = idy;\n";
   os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
   os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
   os << "      for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
-  os << "        // array\n";
-  os << "        // pe\n";
-  os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1) {\n";
-  os << "          // latency\n";
-  os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1) {\n";
-  os << "            // latency\n";
+  os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1)\n";
+  os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1)\n";
   os << "            for (ap_uint<3> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
   os << "            #pragma HLS PIPELINE II=1\n";
-  os << "              B_t1 fifo_data;\n";
-  os << "              fifo_data = fifo_B_in.read();\n";
+  os << "              " << in1 << "_t1 fifo_data; fifo_data = fifo_" << in1 << "_in.read();\n";
   os << "            }\n";
-  os << "          }\n";
-  os << "        }\n";
   os << "      }\n";
   os << "}\n";
   os << "/* Module Definition */\n\n";
@@ -1093,209 +1107,232 @@ void SystolicHLSEmitter::emitDrainIOL3(StringRef arrayName) {
 
 void SystolicHLSEmitter::emitDrainSerialize(StringRef arrayName, unsigned totalSize) {
   // C_drain_IO_L3_out_serialize
-  // C_t16 = 512 bits, C_t4 = 128 bits, so 512 / 128 = 4
-  unsigned packFactor = 16 / latency;  // 16 / 4 = 4
+  // When systolic.reorder.*.dims/perm are present, write-time reordering uses
+  // nested loops over reordered dimensions for contiguous DRAM writes (see
+  // docs/design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md Phase 1).
+  unsigned packFactor = 16 / latency;
   unsigned iterations = (totalSize * totalSize * 4) / 64;  // 512 bits = 64 bytes
+  unsigned floatsPerWord = 16;
+
   os << "/* Module Definition */\n";
   os << "void " << arrayName << "_drain_IO_L3_out_serialize(" << arrayName 
      << "_t16 *" << arrayName << ", hls::stream<" << arrayName << "_t" << latency 
      << "> &fifo_" << arrayName << "_drain_local_in) {\n";
   os << "#pragma HLS INLINE OFF\n";
-  os << "  /* Variable Declaration */\n";
-  os << "  /* Variable Declaration */\n\n";
-  os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " 
-     << iterations << "; i++) {\n";
-  os << "  #pragma HLS PIPELINE II=1\n";
-  os << "    " << arrayName << "_t" << latency << " fifo_data;\n";
-  os << "    " << arrayName << "_t16 mem_data;\n";
-  os << "    " << arrayName << "_t" << latency << " mem_data_split[" << packFactor << "];\n";
-  os << "    #pragma HLS ARRAY_PARTITION variable=mem_data_split complete\n";
-  os << "    for (ap_uint<3> p = 0; p < " << packFactor << "; p++) {\n";
-  os << "      fifo_data = fifo_" << arrayName << "_drain_local_in.read();\n";
-  os << "      mem_data_split[p] = fifo_data;\n";
-  os << "    }\n";
-  os << "    mem_data = (";
-  for (unsigned i = packFactor - 1; i > 0; i--) {
-    os << "mem_data_split[" << i << "], ";
+
+  if (hasReordering2D(arrayName)) {
+    // Write-time reordering: fill buffer from fifo (compute order), reorder into
+    // buffer_linear, then pack and write so DRAM write order is contiguous in reordered layout.
+    unsigned loopBits = (unsigned)ceil(log2(totalSize + 1));
+    auto origExprs = getOriginalIndexExprs2D(arrayName, "d0", "d1");
+    std::string linearExpr = getLinearIndexFromReordered2D(arrayName, "d0", "d1", totalSize);
+    if (origExprs.size() != 2 || linearExpr.empty()) {
+      // Fallback to non-reordered path if helpers failed
+      os << "  /* Variable Declaration */\n\n";
+      os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " 
+         << iterations << "; i++) {\n";
+      os << "  #pragma HLS PIPELINE II=1\n";
+      os << "    " << arrayName << "_t" << latency << " fifo_data;\n";
+      os << "    " << arrayName << "_t16 mem_data;\n";
+      os << "    " << arrayName << "_t" << latency << " mem_data_split[" << packFactor << "];\n";
+      os << "    #pragma HLS ARRAY_PARTITION variable=mem_data_split complete\n";
+      os << "    for (ap_uint<3> p = 0; p < " << packFactor << "; p++) {\n";
+      os << "      fifo_data = fifo_" << arrayName << "_drain_local_in.read();\n";
+      os << "      mem_data_split[p] = fifo_data;\n";
+      os << "    }\n";
+      os << "    mem_data = (";
+      for (unsigned i = packFactor - 1; i > 0; i--) os << "mem_data_split[" << i << "], ";
+      os << "mem_data_split[0]);\n";
+      os << "    " << arrayName << "[i] = mem_data;\n";
+      os << "  }\n";
+      os << "}\n";
+      os << "/* Module Definition */\n\n";
+      return;
+    }
+    os << "  /* Write-time reordering: buffer -> reorder -> pack & write */\n";
+    os << "  float buffer[" << totalSize << "][" << totalSize << "];\n";
+    os << "  float buffer_linear[" << (totalSize * totalSize) << "];\n";
+    os << "  union { float f; uint32_t u; } tmp;\n";
+    os << "  /* Phase 1: unpack fifo into buffer (row-major compute order) */\n";
+    os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " << iterations << "; i++) {\n";
+    os << "  #pragma HLS PIPELINE II=1\n";
+    os << "    " << arrayName << "_t" << latency << " fifo_data;\n";
+    os << "    " << arrayName << "_t" << latency << " mem_data_split[" << packFactor << "];\n";
+    os << "    #pragma HLS ARRAY_PARTITION variable=mem_data_split complete\n";
+    os << "    for (ap_uint<3> p = 0; p < " << packFactor << "; p++) {\n";
+    os << "      fifo_data = fifo_" << arrayName << "_drain_local_in.read();\n";
+    os << "      mem_data_split[p] = fifo_data;\n";
+    os << "    }\n";
+    os << "    for (ap_uint<3> p = 0; p < " << packFactor << "; p++)\n";
+    os << "      for (ap_uint<3> f = 0; f < " << latency << "; f++) {\n";
+    os << "        unsigned idx = i * " << floatsPerWord << " + p * " << latency << " + f;\n";
+    os << "        unsigned r = idx / " << totalSize << ", c = idx % " << totalSize << ";\n";
+    os << "        tmp.u = mem_data_split[p].range(32*(int)(f+1)-1, 32*(int)f).to_uint();\n";
+    os << "        buffer[r][c] = tmp.f;\n";
+    os << "      }\n";
+    os << "  }\n";
+    os << "  /* Phase 2: reorder into buffer_linear (reordered dimension order) */\n";
+    os << "  for (ap_uint<" << loopBits << "> d0 = 0; d0 < " << totalSize << "; d0++)\n";
+    os << "    for (ap_uint<" << loopBits << "> d1 = 0; d1 < " << totalSize << "; d1++) {\n";
+    os << "      unsigned linear = " << linearExpr << ";\n";
+    os << "      buffer_linear[linear] = buffer[" << origExprs[0] << "][" << origExprs[1] << "];\n";
+    os << "    }\n";
+    os << "  /* Phase 3: pack and write to DRAM */\n";
+    os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " << iterations << "; i++) {\n";
+    os << "  #pragma HLS PIPELINE II=1\n";
+    os << "    " << arrayName << "_t16 mem_data;\n";
+    os << "    float *ptr = (float *)&mem_data;\n";
+    os << "    for (ap_uint<4> k = 0; k < " << floatsPerWord << "; k++)\n";
+    os << "      ptr[k] = buffer_linear[i * " << floatsPerWord << " + k];\n";
+    os << "    " << arrayName << "[i] = mem_data;\n";
+    os << "  }\n";
+  } else {
+    os << "  /* Variable Declaration */\n\n";
+    os << "  for (ap_uint<" << (unsigned)ceil(log2(iterations + 1)) << "> i = 0; i < " 
+       << iterations << "; i++) {\n";
+    os << "  #pragma HLS PIPELINE II=1\n";
+    os << "    " << arrayName << "_t" << latency << " fifo_data;\n";
+    os << "    " << arrayName << "_t16 mem_data;\n";
+    os << "    " << arrayName << "_t" << latency << " mem_data_split[" << packFactor << "];\n";
+    os << "    #pragma HLS ARRAY_PARTITION variable=mem_data_split complete\n";
+    os << "    for (ap_uint<3> p = 0; p < " << packFactor << "; p++) {\n";
+    os << "      fifo_data = fifo_" << arrayName << "_drain_local_in.read();\n";
+    os << "      mem_data_split[p] = fifo_data;\n";
+    os << "    }\n";
+    os << "    mem_data = (";
+    for (unsigned i = packFactor - 1; i > 0; i--) {
+      os << "mem_data_split[" << i << "], ";
+    }
+    os << "mem_data_split[0]);\n";
+    os << "    " << arrayName << "[i] = mem_data;\n";
+    os << "  }\n";
   }
-  os << "mem_data_split[0]);\n";
-  os << "    " << arrayName << "[i] = mem_data;\n";
-  os << "  }\n";
   os << "}\n";
   os << "/* Module Definition */\n\n";
 }
 
 void SystolicHLSEmitter::emitTopKernel(func::FuncOp funcOp) {
+  const std::string &in0 = inputNames[0], &in1 = inputNames[1], &out = outputName;
   os << "extern \"C\" {\n";
-  os << "void kernel0(A_t16 *A, B_t16 *B, C_t16 *C) {\n";
-  os << "#pragma HLS INTERFACE m_axi port=A offset=slave bundle=gmem_A\n";
-  os << "#pragma HLS INTERFACE m_axi port=B offset=slave bundle=gmem_B\n";
-  os << "#pragma HLS INTERFACE m_axi port=C offset=slave bundle=gmem_C\n";
-  os << "#pragma HLS INTERFACE s_axilite port=A bundle=control\n";
-  os << "#pragma HLS INTERFACE s_axilite port=B bundle=control\n";
-  os << "#pragma HLS INTERFACE s_axilite port=C bundle=control\n";
+  os << "void kernel0(" << in0 << "_t16 *" << in0 << ", " << in1 << "_t16 *" << in1 << ", " << out << "_t16 *" << out << ") {\n";
+  os << "#pragma HLS INTERFACE m_axi port=" << in0 << " offset=slave bundle=gmem_" << in0 << "\n";
+  os << "#pragma HLS INTERFACE m_axi port=" << in1 << " offset=slave bundle=gmem_" << in1 << "\n";
+  os << "#pragma HLS INTERFACE m_axi port=" << out << " offset=slave bundle=gmem_" << out << "\n";
+  os << "#pragma HLS INTERFACE s_axilite port=" << in0 << " bundle=control\n";
+  os << "#pragma HLS INTERFACE s_axilite port=" << in1 << " bundle=control\n";
+  os << "#pragma HLS INTERFACE s_axilite port=" << out << " bundle=control\n";
   os << "#pragma HLS INTERFACE s_axilite port=return bundle=control\n\n";
   os << "#pragma HLS DATAFLOW\n\n";
   
-  // FIFO declarations
   os << "  /* FIFO Declaration */\n";
-  os << "  hls::stream<A_t" << arrayPart << "> fifo_A_A_IO_L3_in_serialize;\n";
-  os << "  #pragma HLS STREAM variable=fifo_A_A_IO_L3_in_serialize depth=2\n";
-  os << "  hls::stream<B_t" << arrayPart << "> fifo_B_B_IO_L3_in_serialize;\n";
-  os << "  #pragma HLS STREAM variable=fifo_B_B_IO_L3_in_serialize depth=2\n";
-  os << "  hls::stream<C_t" << latency << "> fifo_C_drain_C_drain_IO_L3_out_serialize;\n";
-  os << "  #pragma HLS STREAM variable=fifo_C_drain_C_drain_IO_L3_out_serialize depth=2\n";
-  os << "  #pragma HLS RESOURCE variable=fifo_C_drain_C_drain_IO_L3_out_serialize core=FIFO_SRL\n\n";
+  os << "  hls::stream<" << in0 << "_t" << arrayPart << "> fifo_" << in0 << "_" << in0 << "_IO_L3_in_serialize;\n";
+  os << "  #pragma HLS STREAM variable=fifo_" << in0 << "_" << in0 << "_IO_L3_in_serialize depth=2\n";
+  os << "  hls::stream<" << in1 << "_t" << arrayPart << "> fifo_" << in1 << "_" << in1 << "_IO_L3_in_serialize;\n";
+  os << "  #pragma HLS STREAM variable=fifo_" << in1 << "_" << in1 << "_IO_L3_in_serialize depth=2\n";
+  os << "  hls::stream<" << out << "_t" << latency << "> fifo_" << out << "_drain_" << out << "_drain_IO_L3_out_serialize;\n";
+  os << "  #pragma HLS STREAM variable=fifo_" << out << "_drain_" << out << "_drain_IO_L3_out_serialize depth=2\n";
+  os << "  #pragma HLS RESOURCE variable=fifo_" << out << "_drain_" << out << "_drain_IO_L3_out_serialize core=FIFO_SRL\n\n";
   
-  // L2 FIFOs
   for (unsigned i = 0; i <= numPE; i++) {
-    os << "  hls::stream<A_t" << arrayPart << "> fifo_A_A_IO_L2_in_" << i << ";\n";
-    os << "  #pragma HLS STREAM variable=fifo_A_A_IO_L2_in_" << i << " depth=2\n";
-    os << "  #pragma HLS RESOURCE variable=fifo_A_A_IO_L2_in_" << i << " core=FIFO_SRL\n";
+    os << "  hls::stream<" << in0 << "_t" << arrayPart << "> fifo_" << in0 << "_" << in0 << "_IO_L2_in_" << i << ";\n";
+    os << "  #pragma HLS STREAM variable=fifo_" << in0 << "_" << in0 << "_IO_L2_in_" << i << " depth=2\n";
+    os << "  #pragma HLS RESOURCE variable=fifo_" << in0 << "_" << in0 << "_IO_L2_in_" << i << " core=FIFO_SRL\n";
   }
   for (unsigned i = 0; i <= numPE; i++) {
-    os << "  hls::stream<B_t" << arrayPart << "> fifo_B_B_IO_L2_in_" << i << ";\n";
-    os << "  #pragma HLS STREAM variable=fifo_B_B_IO_L2_in_" << i << " depth=2\n";
-    os << "  #pragma HLS RESOURCE variable=fifo_B_B_IO_L2_in_" << i << " core=FIFO_SRL\n";
+    os << "  hls::stream<" << in1 << "_t" << arrayPart << "> fifo_" << in1 << "_" << in1 << "_IO_L2_in_" << i << ";\n";
+    os << "  #pragma HLS STREAM variable=fifo_" << in1 << "_" << in1 << "_IO_L2_in_" << i << " depth=2\n";
+    os << "  #pragma HLS RESOURCE variable=fifo_" << in1 << "_" << in1 << "_IO_L2_in_" << i << " core=FIFO_SRL\n";
   }
-  
-  // PE FIFOs
   for (unsigned i = 0; i < numPE; i++) {
     for (unsigned j = 0; j <= numPE; j++) {
-      os << "  hls::stream<float> fifo_A_PE_" << i << "_" << j << ";\n";
-      os << "  #pragma HLS STREAM variable=fifo_A_PE_" << i << "_" << j << " depth=2\n";
-      os << "  #pragma HLS RESOURCE variable=fifo_A_PE_" << i << "_" << j << " core=FIFO_SRL\n";
+      os << "  hls::stream<float> fifo_" << in0 << "_PE_" << i << "_" << j << ";\n";
+      os << "  #pragma HLS STREAM variable=fifo_" << in0 << "_PE_" << i << "_" << j << " depth=2\n";
+      os << "  #pragma HLS RESOURCE variable=fifo_" << in0 << "_PE_" << i << "_" << j << " core=FIFO_SRL\n";
     }
   }
   for (unsigned i = 0; i <= numPE; i++) {
     for (unsigned j = 0; j < numPE; j++) {
-      os << "  hls::stream<float> fifo_B_PE_" << i << "_" << j << ";\n";
-      os << "  #pragma HLS STREAM variable=fifo_B_PE_" << i << "_" << j << " depth=2\n";
-      os << "  #pragma HLS RESOURCE variable=fifo_B_PE_" << i << "_" << j << " core=FIFO_SRL\n";
+      os << "  hls::stream<float> fifo_" << in1 << "_PE_" << i << "_" << j << ";\n";
+      os << "  #pragma HLS STREAM variable=fifo_" << in1 << "_PE_" << i << "_" << j << " depth=2\n";
+      os << "  #pragma HLS RESOURCE variable=fifo_" << in1 << "_PE_" << i << "_" << j << " core=FIFO_SRL\n";
     }
   }
   for (unsigned i = 0; i < numPE; i++) {
     for (unsigned j = 0; j < numPE; j++) {
-      os << "  hls::stream<float> fifo_C_drain_PE_" << i << "_" << j << ";\n";
-      os << "  #pragma HLS STREAM variable=fifo_C_drain_PE_" << i << "_" << j << " depth=2\n";
-      os << "  #pragma HLS RESOURCE variable=fifo_C_drain_PE_" << i << "_" << j << " core=FIFO_SRL\n";
+      os << "  hls::stream<float> fifo_" << out << "_drain_PE_" << i << "_" << j << ";\n";
+      os << "  #pragma HLS STREAM variable=fifo_" << out << "_drain_PE_" << i << "_" << j << " depth=2\n";
+      os << "  #pragma HLS RESOURCE variable=fifo_" << out << "_drain_PE_" << i << "_" << j << " core=FIFO_SRL\n";
     }
   }
-  // Drain L1 FIFOs
   for (unsigned i = 0; i < numPE; i++) {
     for (unsigned j = 0; j <= numPE; j++) {
-      os << "  hls::stream<C_t" << latency << "> fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << j << ";\n";
-      os << "  #pragma HLS STREAM variable=fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << j << " depth=2\n";
-      os << "  #pragma HLS RESOURCE variable=fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << j << " core=FIFO_SRL\n";
+      os << "  hls::stream<" << out << "_t" << latency << "> fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << j << ";\n";
+      os << "  #pragma HLS STREAM variable=fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << j << " depth=2\n";
+      os << "  #pragma HLS RESOURCE variable=fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << j << " core=FIFO_SRL\n";
     }
   }
-  // Drain L2 FIFOs
   for (unsigned i = 0; i <= numPE; i++) {
-    os << "  hls::stream<C_t" << latency << "> fifo_C_drain_C_drain_IO_L2_out_" << i << ";\n";
-    os << "  #pragma HLS STREAM variable=fifo_C_drain_C_drain_IO_L2_out_" << i << " depth=2\n";
-    os << "  #pragma HLS RESOURCE variable=fifo_C_drain_C_drain_IO_L2_out_" << i << " core=FIFO_SRL\n";
+    os << "  hls::stream<" << out << "_t" << latency << "> fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << i << ";\n";
+    os << "  #pragma HLS STREAM variable=fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << i << " depth=2\n";
+    os << "  #pragma HLS RESOURCE variable=fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << i << " core=FIFO_SRL\n";
   }
   os << "  /* FIFO Declaration */\n\n";
   
-  // Module calls
   os << "  /* Module Call */\n";
-  os << "  A_IO_L3_in_serialize(A, fifo_A_A_IO_L3_in_serialize);\n";
-  os << "  A_IO_L3_in(fifo_A_A_IO_L3_in_serialize, fifo_A_A_IO_L2_in_0);\n";
+  os << "  " << in0 << "_IO_L3_in_serialize(" << in0 << ", fifo_" << in0 << "_" << in0 << "_IO_L3_in_serialize);\n";
+  os << "  " << in0 << "_IO_L3_in(fifo_" << in0 << "_" << in0 << "_IO_L3_in_serialize, fifo_" << in0 << "_" << in0 << "_IO_L2_in_0);\n";
   for (unsigned i = 0; i < numPE - 1; i++) {
-    os << "  A_IO_L2_in(" << i << ", fifo_A_A_IO_L2_in_" << i 
-       << ", fifo_A_A_IO_L2_in_" << (i + 1) << ", fifo_A_PE_" << i << "_0);\n";
+    os << "  " << in0 << "_IO_L2_in(" << i << ", fifo_" << in0 << "_" << in0 << "_IO_L2_in_" << i
+       << ", fifo_" << in0 << "_" << in0 << "_IO_L2_in_" << (i + 1) << ", fifo_" << in0 << "_PE_" << i << "_0);\n";
   }
-  os << "  A_IO_L2_in_boundary(" << (numPE - 1) << ", fifo_A_A_IO_L2_in_" 
-     << (numPE - 1) << ", fifo_A_PE_" << (numPE - 1) << "_0);\n\n";
+  os << "  " << in0 << "_IO_L2_in_boundary(" << (numPE - 1) << ", fifo_" << in0 << "_" << in0 << "_IO_L2_in_"
+     << (numPE - 1) << ", fifo_" << in0 << "_PE_" << (numPE - 1) << "_0);\n\n";
   
-  os << "  B_IO_L3_in_serialize(B, fifo_B_B_IO_L3_in_serialize);\n";
-  os << "  B_IO_L3_in(fifo_B_B_IO_L3_in_serialize, fifo_B_B_IO_L2_in_0);\n";
+  os << "  " << in1 << "_IO_L3_in_serialize(" << in1 << ", fifo_" << in1 << "_" << in1 << "_IO_L3_in_serialize);\n";
+  os << "  " << in1 << "_IO_L3_in(fifo_" << in1 << "_" << in1 << "_IO_L3_in_serialize, fifo_" << in1 << "_" << in1 << "_IO_L2_in_0);\n";
   for (unsigned j = 0; j < numPE - 1; j++) {
-    os << "  B_IO_L2_in(" << j << ", fifo_B_B_IO_L2_in_" << j 
-       << ", fifo_B_B_IO_L2_in_" << (j + 1) << ", fifo_B_PE_0_" << j << ");\n";
+    os << "  " << in1 << "_IO_L2_in(" << j << ", fifo_" << in1 << "_" << in1 << "_IO_L2_in_" << j
+       << ", fifo_" << in1 << "_" << in1 << "_IO_L2_in_" << (j + 1) << ", fifo_" << in1 << "_PE_0_" << j << ");\n";
   }
-  os << "  B_IO_L2_in_boundary(" << (numPE - 1) << ", fifo_B_B_IO_L2_in_" 
-     << (numPE - 1) << ", fifo_B_PE_0_" << (numPE - 1) << ");\n\n";
+  os << "  " << in1 << "_IO_L2_in_boundary(" << (numPE - 1) << ", fifo_" << in1 << "_" << in1 << "_IO_L2_in_"
+     << (numPE - 1) << ", fifo_" << in1 << "_PE_0_" << (numPE - 1) << ");\n\n";
   
-  // PE array calls
   for (unsigned i = 0; i < numPE; i++) {
     for (unsigned j = 0; j < numPE; j++) {
       os << "  PE_wrapper(" << i << ", " << j << ", "
-         << "fifo_A_PE_" << i << "_" << j << ", fifo_A_PE_" << i << "_" << (j + 1) << ", "
-         << "fifo_B_PE_" << i << "_" << j << ", fifo_B_PE_" << (i + 1) << "_" << j << ", "
-         << "fifo_C_drain_PE_" << i << "_" << j << ");\n";
+         << "fifo_" << in0 << "_PE_" << i << "_" << j << ", fifo_" << in0 << "_PE_" << i << "_" << (j + 1) << ", "
+         << "fifo_" << in1 << "_PE_" << i << "_" << j << ", fifo_" << in1 << "_PE_" << (i + 1) << "_" << j << ", "
+         << "fifo_" << out << "_drain_PE_" << i << "_" << j << ");\n";
     }
   }
   os << "\n";
-  
-  // Dummy modules
   for (unsigned i = 0; i < numPE; i++) {
-    os << "  A_PE_dummy_in(" << i << ", " << (numPE - 1) << ", fifo_A_PE_" 
-       << i << "_" << numPE << ");\n";
+    os << "  " << in0 << "_PE_dummy_in(" << i << ", " << (numPE - 1) << ", fifo_" << in0 << "_PE_" << i << "_" << numPE << ");\n";
   }
   for (unsigned j = 0; j < numPE; j++) {
-    os << "  B_PE_dummy_in(" << (numPE - 1) << ", " << j << ", fifo_B_PE_" 
-       << numPE << "_" << j << ");\n";
+    os << "  " << in1 << "_PE_dummy_in(" << (numPE - 1) << ", " << j << ", fifo_" << in1 << "_PE_" << numPE << "_" << j << ");\n";
   }
   os << "\n";
   
-  // Drain modules
-  os << "  /* C drain modules */\n";
-  // L1 drain modules - process by column (j), from rightmost to leftmost
+  os << "  /* " << out << " drain modules */\n";
   for (unsigned j = numPE - 1; j > 0; j--) {
-    // First boundary wrapper for this column
     for (unsigned i = 0; i < numPE; i++) {
       if (j == numPE - 1) {
-        // Rightmost column: boundary wrapper
-        os << "  C_drain_IO_L1_out_boundary_wrapper(\n";
-        os << "    /* module id */ " << i << ", \n";
-        os << "    /* module id */ " << j << ", \n";
-        os << "    /* fifo */ fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << j << ", \n";
-        os << "    /* fifo */ fifo_C_drain_PE_" << i << "_" << j << "\n";
-        os << "  );\n";
-        os << "  /* Module Call */\n\n";
+        os << "  " << out << "_drain_IO_L1_out_boundary_wrapper(\n";
+        os << "    " << i << ", " << j << ", fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << j << ", fifo_" << out << "_drain_PE_" << i << "_" << j << "\n  );\n";
       }
-      // Regular wrapper for this column
-      os << "  C_drain_IO_L1_out_wrapper(\n";
-      os << "    /* module id */ " << i << ", \n";
-      os << "    /* module id */ " << (j - 1) << ", \n";
-      os << "    /* fifo */ fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << j << ", \n";
-      os << "    /* fifo */ fifo_C_drain_C_drain_IO_L1_out_" << i << "_" << (j - 1) << ", \n";
-      os << "    /* fifo */ fifo_C_drain_PE_" << i << "_" << (j - 1) << "\n";
-      os << "  );\n";
-      os << "  /* Module Call */\n\n";
+      os << "  " << out << "_drain_IO_L1_out_wrapper(\n";
+      os << "    " << i << ", " << (j - 1) << ", fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << j
+         << ", fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_" << (j - 1) << ", fifo_" << out << "_drain_PE_" << i << "_" << (j - 1) << "\n  );\n";
     }
   }
-  // L2 drain modules - boundary first
-  os << "  C_drain_IO_L2_out_boundary(\n";
-  os << "    /* module id */ " << (numPE - 1) << ", \n";
-  os << "    /* fifo */ fifo_C_drain_C_drain_IO_L2_out_" << (numPE - 1) << ", \n";
-  os << "    /* fifo */ fifo_C_drain_C_drain_IO_L1_out_" << (numPE - 1) << "_0\n";
-  os << "  );\n";
-  os << "  /* Module Call */\n\n";
-  // L2 drain modules - regular
+  os << "  " << out << "_drain_IO_L2_out_boundary(" << (numPE - 1) << ", fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << (numPE - 1) << ", fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << (numPE - 1) << "_0);\n";
   for (unsigned i = 0; i < numPE - 1; i++) {
-    os << "  C_drain_IO_L2_out(\n";
-    os << "    /* module id */ " << i << ", \n";
-    os << "    /* fifo */ fifo_C_drain_C_drain_IO_L2_out_" << (i + 1) << ", \n";
-    os << "    /* fifo */ fifo_C_drain_C_drain_IO_L2_out_" << i << ", \n";
-    os << "    /* fifo */ fifo_C_drain_C_drain_IO_L1_out_" << i << "_0\n";
-    os << "  );\n";
-    os << "  /* Module Call */\n\n";
+    os << "  " << out << "_drain_IO_L2_out(" << i << ", fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << (i + 1)
+       << ", fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_" << i << ", fifo_" << out << "_drain_" << out << "_drain_IO_L1_out_" << i << "_0);\n";
   }
-  // L3 drain modules
-  os << "  C_drain_IO_L3_out(\n";
-  os << "    /* fifo */ fifo_C_drain_C_drain_IO_L3_out_serialize, \n";
-  os << "    /* fifo */ fifo_C_drain_C_drain_IO_L2_out_0\n";
-  os << "  );\n";
-  os << "  /* Module Call */\n\n";
-  // L3 serialize
-  os << "  C_drain_IO_L3_out_serialize(\n";
-  os << "    /* array */ C, \n";
-  os << "    /* fifo */ fifo_C_drain_C_drain_IO_L3_out_serialize\n";
-  os << "  );\n";
-  os << "  /* Module Call */\n\n";
-  
+  os << "  " << out << "_drain_IO_L3_out(fifo_" << out << "_drain_" << out << "_drain_IO_L3_out_serialize, fifo_" << out << "_drain_" << out << "_drain_IO_L2_out_0);\n";
+  os << "  " << out << "_drain_IO_L3_out_serialize(" << out << ", fifo_" << out << "_drain_" << out << "_drain_IO_L3_out_serialize);\n";
   os << "}\n";
   os << "}\n";
 }
@@ -1368,16 +1405,19 @@ void SystolicHLSEmitter::extractReorderingInfo(func::FuncOp funcOp) {
         
         arrayReordering[arrayName] = info;
         
-        llvm::dbgs() << "Extracted reordering info for " << arrayName << ":\n"
-                     << "  Original: [" << info.originalDims[0] << ", "
-                     << info.originalDims[1] << ", "
-                     << info.originalDims[2] << "]\n"
-                     << "  Reordered: [" << info.reorderedDims[0] << ", "
-                     << info.reorderedDims[1] << ", "
-                     << info.reorderedDims[2] << "]\n"
-                     << "  Permutation: [" << info.dimPermutation[0] << ", "
-                     << info.dimPermutation[1] << ", "
-                     << info.dimPermutation[2] << "]\n";
+        LLVM_DEBUG({
+          llvm::dbgs() << "Extracted reordering info for " << arrayName << ":\n";
+          llvm::dbgs() << "  Original: [";
+          for (size_t i = 0; i < info.originalDims.size(); i++)
+            llvm::dbgs() << (i ? ", " : "") << info.originalDims[i];
+          llvm::dbgs() << "]\n  Reordered: [";
+          for (size_t i = 0; i < info.reorderedDims.size(); i++)
+            llvm::dbgs() << (i ? ", " : "") << info.reorderedDims[i];
+          llvm::dbgs() << "]\n  Permutation: [";
+          for (size_t i = 0; i < info.dimPermutation.size(); i++)
+            llvm::dbgs() << (i ? ", " : "") << info.dimPermutation[i];
+          llvm::dbgs() << "]\n";
+        });
       }
     }
   }
@@ -1408,52 +1448,87 @@ SmallVector<std::string, 3> SystolicHLSEmitter::applyAccessPermutation(
   }
 }
 
+bool SystolicHLSEmitter::hasReordering2D(StringRef arrayName) const {
+  auto it = arrayReordering.find(arrayName.str());
+  return it != arrayReordering.end() && it->second.needsReordering() &&
+         it->second.originalDims.size() == 2 && it->second.dimPermutation.size() == 2;
+}
+
+std::string SystolicHLSEmitter::getLinearIndexFromReordered2D(StringRef arrayName,
+                                                            StringRef d0Var, StringRef d1Var,
+                                                            unsigned sizeLiteral) const {
+  auto it = arrayReordering.find(arrayName.str());
+  if (it == arrayReordering.end() || it->second.originalDims.size() != 2 ||
+      it->second.dimPermutation.size() != 2)
+    return "";
+  const auto &info = it->second;
+  SmallVector<unsigned, 2> invPerm(2);
+  for (unsigned i = 0; i < 2; i++)
+    invPerm[info.dimPermutation[i]] = i;
+  std::string d0s = d0Var.str(), d1s = d1Var.str();
+  std::string orig0 = (invPerm[0] == 0) ? d0s : d1s;
+  std::string orig1 = (invPerm[1] == 0) ? d0s : d1s;
+  std::string dimStr = sizeLiteral ? std::to_string(sizeLiteral) : "size";
+  return orig0 + " * " + dimStr + " + " + orig1;
+}
+
+SmallVector<std::string, 2> SystolicHLSEmitter::getOriginalIndexExprs2D(
+    StringRef arrayName, StringRef d0Var, StringRef d1Var) const {
+  SmallVector<std::string, 2> result;
+  auto it = arrayReordering.find(arrayName.str());
+  if (it == arrayReordering.end() || it->second.dimPermutation.size() != 2)
+    return result;
+  const auto &info = it->second;
+  SmallVector<unsigned, 2> invPerm(2);
+  for (unsigned i = 0; i < 2; i++)
+    invPerm[info.dimPermutation[i]] = i;
+  std::string d0s = d0Var.str(), d1s = d1Var.str();
+  result.push_back((invPerm[0] == 0) ? d0s : d1s);
+  result.push_back((invPerm[1] == 0) ? d0s : d1s);
+  return result;
+}
+
 LogicalResult SystolicHLSEmitter::emitFunc(func::FuncOp funcOp) {
   emitTopKernel(funcOp);
   return success();
 }
 
 LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
-  // 在处理函数之前，提取重排信息
-  for (auto funcOp : module.getOps<func::FuncOp>()) {
-    extractReorderingInfo(funcOp);
+  auto funcOps = module.getOps<func::FuncOp>();
+  if (!funcOps.empty()) {
+    func::FuncOp firstFunc = *funcOps.begin();
+    extractReorderingInfo(firstFunc);
+    deriveArrayNamesFromFunction(firstFunc);
+  } else {
+    inputNames.assign({"A", "B"});
+    outputName = "C";
   }
   
   emitFileHeader();
   emitTypeDefinitions();
   emitModuleDeclarations();
   
-  // Emit module implementations
-  emitIOL3InSerialize("A", "float", size);
-  emitIOL3In("A", "float");
-  emitIOL2InIntraTrans("A");
-  emitIOL2InInterTrans("A");
-  emitIOL2InInterTransBoundary("A");
-  emitIOL2In("A");
-  emitIOL2InBoundary("A");
-  emitIOL3InSerialize("B", "float", size);
-  emitIOL3In("B", "float");
-  emitIOL2InIntraTrans("B");
-  emitIOL2InInterTrans("B");
-  emitIOL2InInterTransBoundary("B");
-  emitIOL2In("B");
-  emitIOL2InBoundary("B");
+  for (const auto &name : inputNames) {
+    emitIOL3InSerialize(name, "float", size);
+    emitIOL3In(name, "float");
+    emitIOL2InIntraTrans(name);
+    emitIOL2InInterTrans(name);
+    emitIOL2InInterTransBoundary(name);
+    emitIOL2In(name);
+    emitIOL2InBoundary(name);
+  }
   emitPE();
   emitPEWrapper();
   emitDummyModules();
-  emitDrainIOL1("C");
-  emitDrainIOL2("C");
-  emitDrainIOL3("C");
-  emitDrainSerialize("C", size);
+  emitDrainIOL1(outputName);
+  emitDrainIOL2(outputName);
+  emitDrainIOL3(outputName);
+  emitDrainSerialize(outputName, size);
   
-  // Emit top kernel - only emit once (not per function)
-  // Note: We only emit one kernel0 regardless of how many FuncOps exist
-  auto funcOps = module.getOps<func::FuncOp>();
   if (!funcOps.empty()) {
     if (failed(emitFunc(*funcOps.begin())))
       return failure();
   }
-  
   return success();
 }
 

@@ -8,6 +8,8 @@
 
 **📖 [docs/README.md](docs/README.md) - 完整文档导航入口 ⭐**
 
+**📋 [RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md) - 近期修改与下一步工作（进度记录与文档索引）**
+
 ### 快速链接
 - **[docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md)** — 系统架构概述
 - **[docs/guide/CODE_STRUCTURE.md](docs/guide/CODE_STRUCTURE.md)** — 代码组织与结构
@@ -217,6 +219,16 @@ git submodule update --init --recursive
 
 # 3. 构建 mlir-systolic
 ./scripts/build-systolic.sh
+```
+
+### 快速回归测试（MM 端到端）
+
+构建完成后，可用以下命令跑通 opt → translate 并检查生成的 HLS C++：
+
+```bash
+./test/run_mm_e2e.sh
+# 成功时输出 PASS 及生成文件路径；失败时输出 FAIL 与缺失符号。
+# 详见 docs/design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md 与 docs/status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md
 ```
 
 ### 详细说明

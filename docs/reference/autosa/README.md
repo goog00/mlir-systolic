@@ -17,19 +17,21 @@
    - AutoSA 架构详细分析
    - 系统设计和组件说明
 
-3. **[AUTOSA_SPACETIME_ANALYSIS.md](AUTOSA_SPACETIME_ANALYSIS.md)**
-   - Spacetime 参数详细分析（0-5）
-   - 不同 spacetime 配置的影响
+3. **[AUTOSA_SOURCE_PERF_AND_MLIR_OPPORTUNITIES.md](AUTOSA_SOURCE_PERF_AND_MLIR_OPPORTUNITIES.md)**
+   - AutoSA 源码逻辑与编译流水线
+   - 脉动阵列性能瓶颈与可改进空间（含 MTTKRP 随机/跨步访存案例）
+   - 在 MLIR 框架下的优化机会与落地建议
 
-4. **[AUTOSA_TEST_GENERATION_GUIDE.md](AUTOSA_TEST_GENERATION_GUIDE.md)**
-   - 参数配置参考
-   - 测试用例生成指南
+### 对比与对照
 
-### 对比文档
-
-5. **[comparison_with_autosa.md](comparison_with_autosa.md)**
+4. **[comparison_with_autosa.md](comparison_with_autosa.md)**
    - mlir-systolic 与 AutoSA 的功能对比
    - 差异分析和兼容性说明
+
+5. **[AUTOSA_VS_MLIR_SYSTOLIC_COMPARATIVE_ANALYSIS.md](AUTOSA_VS_MLIR_SYSTOLIC_COMPARATIVE_ANALYSIS.md)** ⭐
+   - AutoSA 与 mlir-systolic 源码/阶段逐项对照
+   - 结合 AUTOSA_SOURCE_PERF 与 VISION 的打通完整流程建议
+   - 简单 CNN（5-loop + 固定 spacetime）支持路径与任务清单
 
 ---
 

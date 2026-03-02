@@ -54,4 +54,5 @@
 
 ---
 
-**参考**: 详尽路线图见 `docs/status/ROADMAP.md`，代码结构见 `docs/CODE_STRUCTURE.md`。
+**参考**: 详尽路线图见 `docs/status/ROADMAP.md`，代码结构见 `docs/guide/CODE_STRUCTURE.md`。  
+**实现与下一步梳理**: 见 [CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md](CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md)（结合文档与运行结果的实现状态与下一步建议）。
