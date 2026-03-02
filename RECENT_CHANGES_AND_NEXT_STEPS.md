@@ -5,6 +5,14 @@
 
 ---
 
+## 工作区与文档整理说明
+
+- **根目录**：新增 [RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md)（本文件），[README.md](README.md) 已加入指向本文件的链接。
+- **测试**：`test/` 下保留 `minimal_matmul.mlir`、`minimal_mttkrp.mlir` 及 `run_mm_e2e.sh`、`run_mttkrp_e2e.sh`；`test/autosa_hls_refs/` 为 AutoSA 参考输出。
+- **文档**：设计/策略类在 [docs/design/](docs/design/)，状态类在 [docs/status/](docs/status/)，AutoSA/Allo 分析在 [docs/reference/](docs/reference/)。完整导航见 [docs/README.md](docs/README.md)。
+
+---
+
 ## 一、本轮完成的主要修改
 
 ### 1. 脉动阵列优化（读时/写时重排）
