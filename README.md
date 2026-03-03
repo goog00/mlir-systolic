@@ -6,7 +6,9 @@
 
 ## 📚 文档导航
 
-**📖 [docs/README.md](docs/README.md) - 完整文档导航入口 ⭐**
+**📖 [docs/README.md](docs/README.md) - 完整文档导航入口**
+
+**📋 [PROJECT_STATUS_AND_ONBOARDING.md](PROJECT_STATUS_AND_ONBOARDING.md) - 项目状态与上手指南（新环境/新 Agent 首选）**
 
 **📋 [RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md) - 近期修改与下一步工作（进度记录与文档索引）**
 

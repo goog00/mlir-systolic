@@ -95,8 +95,8 @@
 
 ### Phase 4：性能与鲁棒性
 
-- FIFO 深度由 dataflow 推导（替代固定 2）。
-- Pipeline 内去除 %、/ 等 HLS 不友好形式。
+- **FIFO 深度**：保持单一可配置（`--fifo-depth`，默认 2），与 AutoSA 一致；**不由 dataflow 推导**作为默认——推导若估小易导致 backpressure/stall，有副作用，详见 [FIFO_DEPTH_AND_PERFORMANCE_NEXT.md](FIFO_DEPTH_AND_PERFORMANCE_NEXT.md)。
+- **性能优先**：RESOURCE 系统化（FIFO_SRL、RAM_2P_BRAM）；Pipeline 内去除 %、/ 等 HLS 不友好形式（strength reduction / 外提）。
 - 与 AutoSA 参考（`test/autosa_hls_refs`）做结构/指标对比。
 
 ---

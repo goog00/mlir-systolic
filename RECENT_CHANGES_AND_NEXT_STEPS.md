@@ -7,9 +7,9 @@
 
 ## 工作区与文档整理说明
 
-- **根目录**：新增 [RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md)（本文件），[README.md](README.md) 已加入指向本文件的链接。
-- **测试**：`test/` 下保留 `minimal_matmul.mlir`、`minimal_mttkrp.mlir` 及 `run_mm_e2e.sh`、`run_mttkrp_e2e.sh`；`test/autosa_hls_refs/` 为 AutoSA 参考输出。
-- **文档**：设计/策略类在 [docs/design/](docs/design/)，状态类在 [docs/status/](docs/status/)，AutoSA/Allo 分析在 [docs/reference/](docs/reference/)。完整导航见 [docs/README.md](docs/README.md)。
+- **根目录**：[RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md)（本文件）记录近期修改与下一步；**[PROJECT_STATUS_AND_ONBOARDING.md](PROJECT_STATUS_AND_ONBOARDING.md)** 为**新环境/新 Agent 上手指南**（做了啥、如何验证、下一步、服务器/Ubuntu18 说明）。[README.md](README.md) 已加入指向本文件的链接。
+- **测试**：`test/` 下保留 `minimal_matmul.mlir`、`minimal_mttkrp.mlir` 及 `run_mm_e2e.sh`、`run_mttkrp_e2e.sh`、`run_all_e2e.sh`；`test/autosa_hls_refs/` 为 AutoSA 参考输出。
+- **文档**：设计/策略类在 [docs/design/](docs/design/)，状态类在 [docs/status/](docs/status/)，AutoSA/Allo 分析在 [docs/reference/](docs/reference/)。**全量文档索引**见 [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)；过时/重复文档已归档至 [docs/archive/](docs/archive/README.md)。导航入口 [docs/README.md](docs/README.md)。
 
 ---
 
@@ -62,10 +62,14 @@
 | 实现状态与下一步 | [docs/status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md](docs/status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md) |
 | 脉动阵列优化计划 | [docs/design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md](docs/design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md) |
 | 参数选择与合法范围 | [docs/design/PARAMETER_SELECTION_AND_VALID_RANGE.md](docs/design/PARAMETER_SELECTION_AND_VALID_RANGE.md) |
+| FIFO 深度与性能下一步 | [docs/design/FIFO_DEPTH_AND_PERFORMANCE_NEXT.md](docs/design/FIFO_DEPTH_AND_PERFORMANCE_NEXT.md) |
 | 已有优化梳理     | [docs/design/EXISTING_OPTIMIZATIONS_IN_CODE.md](docs/design/EXISTING_OPTIMIZATIONS_IN_CODE.md) |
 | 单/多核与高性能策略 | [docs/design/SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md](docs/design/SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md) |
 | 愿景与设计目标   | [docs/VISION_AND_DESIGN_GOALS.md](docs/VISION_AND_DESIGN_GOALS.md) |
 | AutoSA 对照分析  | [docs/reference/autosa/AUTOSA_VS_MLIR_SYSTOLIC_COMPARATIVE_ANALYSIS.md](docs/reference/autosa/AUTOSA_VS_MLIR_SYSTOLIC_COMPARATIVE_ANALYSIS.md) |
+| 移位/除取模与正确性 | [docs/design/SHIFT_VS_DIV_MOD_AND_HLS_CORRECTNESS.md](docs/design/SHIFT_VS_DIV_MOD_AND_HLS_CORRECTNESS.md) |
+| L3 coalesce 设计  | [docs/design/L3_COALESCE_AND_ACCESS_PATTERN.md](docs/design/L3_COALESCE_AND_ACCESS_PATTERN.md) |
+| L3/写时重排与 host-serialize | [docs/design/L3_COALESCE_VS_WRITE_REORDER_AND_HOST_SERIALIZE.md](docs/design/L3_COALESCE_VS_WRITE_REORDER_AND_HOST_SERIALIZE.md) |
 | 文档导航         | [docs/README.md](docs/README.md) |
 
 ---
@@ -93,10 +97,32 @@
 - **全量 e2e 已通过**：`./test/run_all_e2e.sh`（MM、MTTKRP、写时重排 2D、写时重排 3D）已全部通过，可在此基础上推进 (3)(4)。
 - **优先推进**  
   - **(3) 4-loop/MTTKRP 深化**：① **3D 写回验证**：新增 [test/minimal_reorder_write_3d.mlir](test/minimal_reorder_write_3d.mlir)（D[i*8+j,k,l]）与 [test/run_reorder_3d_e2e.sh](test/run_reorder_3d_e2e.sh)，用于验证 `emitDrainSerialize` 的 3D 重排路径。② **3 输入模板**：translate 已支持 3 输入 + 1 输出（`deriveArrayNamesFromFunction` 在 4 个 memref 时取前 3 个为 inputNames、最后 1 个为 outputName）；`emitTopKernel`、`emitPE`、`emitPEWrapper`、`emitDummyModules` 均按 `inputNames.size()` 循环生成 L3/L2/PE FIFO 与调用；PE 计算为所有输入的乘积（in0*in1 或 in0*in1*in2）。  
-  - **(4) FIFO 深度与 HLS 友好化**：FIFO 深度由 dataflow 推导；pipeline 内减少 %、/ 等不利于 HLS 的形式（见改进计划 Phase 4）。
+  - **(4) FIFO 深度与 HLS 友好化**：① **FIFO 深度可配置**：`systolic-translate` 新增 `--fifo-depth`（默认 2），与 AutoSA 一致。② **RESOURCE 系统化（已完成）**：所有 FIFO 声明补全 `#pragma HLS RESOURCE variable=... core=FIFO_SRL`（含输入 L3 序列化 FIFO）；PE/drain 局部数组已使用 `core=RAM_2P_BRAM`。③ **Pipeline 内 %、/ 强度削减（已完成）**：当 `array_part`、`latency` 或重排维度 s1/s2 为 2 的幂时，生成代码用位运算替代取模/除法（`x % N` → `x & (N-1)`，`x / N` → `x >> log2(N)`），有利于 HLS 达到 II=1、提高频率；涉及 L3 serialize 的 `split_idx`、drain inter_trans 的 `split_idx` 与 `c6/latency`、以及 2D/3D 写时重排中的 idx→(r,c) 或 (r0,r1,r2) 分解。④ **HLS 声明/定义一致**：L2 模块的 local 数组声明与定义、调用方（IO_L2_in / IO_L2_in_boundary）的 ping/pong 声明均改为使用 `getArrayDims()`，统一为 `[d0][d1][d2]`，避免声明与定义维度不一致。⑤ **L3 访问与 coalesce（进行中）**：L3_in_serialize 无重排分支改为按 **(c0,c1,c3,c4g)** 与显式 **word_idx** 顺序读 DRAM，与 L3_in 的 tile 顺序一致，便于 burst；设计见 [docs/design/L3_COALESCE_AND_ACCESS_PATTERN.md](docs/design/L3_COALESCE_AND_ACCESS_PATTERN.md)。下一步：与 autosa_hls_refs 逐项对比、在服务器上做 C sim/综合验证。
 - **暂缓**  
   - **(2) 参数与多面体选择范围**：小规模测试与已知 kernel 下参数一般无问题，且已有 AutoSA 可参考；待需要再接入“分析给出选择范围”的流程。  
   - **HLS 综合/上板验证**：本机无 Xilinx HLS/XRT 环境，留待在服务器上做综合与功能验证。
+- **Host-serialize**：**暂不支持**；在各级 IO 处理顺序与复用，避免 host 重排与传输成本。见 [L3_COALESCE_VS_WRITE_REORDER_AND_HOST_SERIALIZE.md](docs/design/L3_COALESCE_VS_WRITE_REORDER_AND_HOST_SERIALIZE.md)。
+
+---
+
+## 四（续）、不考虑 host-serialize 时的后续工作
+
+在**不**做 host-serialize 的前提下，当前可推进的后续工作如下（按优先级）：
+
+1. **与 autosa_hls_refs 逐项对比**  
+   对同一 kernel（如 MM）、相近 size/array_part/latency，对比我们生成与 AutoSA 生成的：模块划分、FIFO 数量与位宽、PIPELINE/RESOURCE 分布、drain 与 L3 访问形式；列出差异并优先补对 II/频率/面积影响大的部分。
+
+2. **服务器上 C sim + 综合验证**  
+   在具备 Xilinx HLS/XRT 的环境做：生成 testbench 或复用 AutoSA 的 host 调用方式；C sim 验证数值正确性；综合看 II、频率、资源；必要时与 AutoSA 同参数结果对比。
+
+3. **可选：L3/drain 的 BURST、BIND_STORAGE 等 pragma**  
+   在 L3 读/写处加 `#pragma HLS BIND_STORAGE` 或 burst 相关提示，进一步对齐 AutoSA 的访存约束（在逐项对比后按需做）。
+
+4. **可选：更多 kernel 与测例**  
+   如简单 CNN、TTMc 等，扩展测例与 e2e 脚本，保证模板与写时重排的普适性。
+
+5. **代码清理**（已做：systolic-translate）  
+   已移除未使用接口：`getTypeName`、`getName`、`getLinearIndexFromReordered3D` 及成员 `valueNames`/`valueCounter`，消除编译 warning。清理后需重新构建并跑 `./test/run_all_e2e.sh` 确认通过。
 
 ### (3) 与 (4) 的先后顺序（基于当前代码）
 
