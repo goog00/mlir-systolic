@@ -28,6 +28,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -296,43 +297,99 @@ void SystolicDataflowGenerationPass::runOnOperation() {
   }
   
   // Step 1.5: Analyze write-time reordering opportunities
-  // This analysis runs on Affine IR, before creating SystolicDataflow operations
-  // So it doesn't require the SystolicDataflow dialect to be loaded
+  // Run on kernel first; if kernel has no load/store (e.g. outlined to callee), run on callees and map attributes to kernel.
+  auto setReorderAttrsFromPatterns = [&](const WriteTimeReorderingAnalyzer &analyzer, func::FuncOp targetFunc) {
+    for (const auto &pattern : analyzer.getPatterns()) {
+      if (!pattern.hasNonLinearAccess || pattern.reorderedDims.empty())
+        continue;
+      std::string arrayName = pattern.arrayName;
+      std::string dimsAttrName = "systolic.reorder." + arrayName + ".dims";
+      std::string permAttrName = "systolic.reorder." + arrayName + ".perm";
+      SmallVector<Attribute, 3> dimAttrs;
+      for (int64_t dim : pattern.reorderedDims)
+        dimAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 64), dim));
+      targetFunc->setAttr(dimsAttrName, ArrayAttr::get(func.getContext(), dimAttrs));
+      SmallVector<Attribute, 3> permAttrs;
+      for (unsigned perm : pattern.dimPermutation)
+        permAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 32), perm));
+      LLVM_DEBUG(llvm::dbgs() << "Stored reordering for " << arrayName << " (dims/perm)\n");
+    }
+  };
+
   WriteTimeReorderingAnalyzer reorderingAnalyzer(func);
   if (failed(reorderingAnalyzer.analyze())) {
-    LLVM_DEBUG(llvm::dbgs() << "Warning: Failed to analyze write-time reordering\n");
+    LLVM_DEBUG(llvm::dbgs() << "Warning: Failed to analyze write-time reordering on kernel\n");
   } else {
-    // Store reordering information in function attributes
-    for (const auto &pattern : reorderingAnalyzer.getPatterns()) {
-      if (pattern.hasNonLinearAccess && !pattern.reorderedDims.empty()) {
-        // Store reordering info as function attributes
-        // Format: "systolic.reorder.<arrayName>.dims" = [dim0, dim1, dim2]
-        //         "systolic.reorder.<arrayName>.perm" = [perm0, perm1, perm2]
-        std::string dimsAttrName = "systolic.reorder." + pattern.arrayName + ".dims";
-        std::string permAttrName = "systolic.reorder." + pattern.arrayName + ".perm";
-        
-        SmallVector<Attribute, 3> dimAttrs;
-        for (int64_t dim : pattern.reorderedDims) {
-          dimAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 64), dim));
-        }
-        func->setAttr(dimsAttrName, ArrayAttr::get(func.getContext(), dimAttrs));
-        
-        SmallVector<Attribute, 3> permAttrs;
-        for (unsigned perm : pattern.dimPermutation) {
-          permAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 32), perm));
-        }
-        func->setAttr(permAttrName, ArrayAttr::get(func.getContext(), permAttrs));
-        
-        LLVM_DEBUG(llvm::dbgs() << "Stored reordering info for " << pattern.arrayName 
-                                << " in function attributes: dims=[" 
-                                << pattern.reorderedDims[0] << ", "
-                                << pattern.reorderedDims[1] << ", "
-                                << pattern.reorderedDims[2] << "], perm=["
-                                << pattern.dimPermutation[0] << ", "
-                                << pattern.dimPermutation[1] << ", "
-                                << pattern.dimPermutation[2] << "]\n");
+    setReorderAttrsFromPatterns(reorderingAnalyzer, func);
+  }
+
+  // If kernel has no reorder patterns (e.g. body is only calls after transform), analyze callees
+  bool hasAnyReorder = false;
+  for (const auto &it : llvm::make_early_inc_range(func->getAttrs())) {
+    if (it.getName().getValue().starts_with("systolic.reorder."))
+      hasAnyReorder = true;
+  }
+  if (!hasAnyReorder) {
+    func.walk([&](func::CallOp callOp) {
+      if (hasAnyReorder)
+        return;
+      auto callee = callOp.getCallableForCallee().dyn_cast<SymbolRefAttr>();
+      if (!callee)
+        return;
+      func::FuncOp calleeFunc = dyn_cast_or_null<func::FuncOp>(SymbolTable::lookupSymbolIn(func->getParentOfType<ModuleOp>(), callee.getRootReference()));
+      if (!calleeFunc || calleeFunc.getBody().empty())
+        return;
+      WriteTimeReorderingAnalyzer calleeAnalyzer(calleeFunc);
+      if (failed(calleeAnalyzer.analyze()))
+        return;
+      for (const auto &pattern : calleeAnalyzer.getPatterns()) {
+        if (!pattern.hasNonLinearAccess || pattern.reorderedDims.empty())
+          continue;
+        hasAnyReorder = true;
+        break;
       }
-    }
+      if (!hasAnyReorder)
+        return;
+      // Map callee arg index -> kernel value for attribute name
+      auto getKernelArgNameForCalleeArg = [&](Value calleeArg) -> Value {
+        if (!calleeArg.isa<BlockArgument>())
+          return nullptr;
+        unsigned calleeIdx = calleeArg.cast<BlockArgument>().getArgNumber();
+        if (calleeIdx >= callOp.getNumOperands())
+          return nullptr;
+        return callOp.getOperand(calleeIdx);
+      };
+      for (const auto &pattern : calleeAnalyzer.getPatterns()) {
+        if (!pattern.hasNonLinearAccess || pattern.reorderedDims.empty())
+          continue;
+        std::string arrayName;
+        if (pattern.memref.isa<BlockArgument>()) {
+          Value kernelVal = getKernelArgNameForCalleeArg(pattern.memref);
+          if (kernelVal && kernelVal.isa<BlockArgument>()) {
+            unsigned kernelIdx = kernelVal.cast<BlockArgument>().getArgNumber();
+            if (auto attr = func.getArgAttrOfType<StringAttr>(kernelIdx, "mlir.name"))
+              arrayName = attr.getValue().str();
+            else
+              arrayName = "arg" + std::to_string(kernelIdx);
+          } else {
+            arrayName = pattern.arrayName;
+          }
+        } else {
+          arrayName = pattern.arrayName;
+        }
+        if (arrayName.empty())
+          continue;
+        SmallVector<Attribute, 3> dimAttrs;
+        for (int64_t dim : pattern.reorderedDims)
+          dimAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 64), dim));
+        func->setAttr("systolic.reorder." + arrayName + ".dims", ArrayAttr::get(func.getContext(), dimAttrs));
+        SmallVector<Attribute, 3> permAttrs;
+        for (unsigned perm : pattern.dimPermutation)
+          permAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 32), perm));
+        func->setAttr("systolic.reorder." + arrayName + ".perm", ArrayAttr::get(func.getContext(), permAttrs));
+        LLVM_DEBUG(llvm::dbgs() << "Stored reordering from callee for " << arrayName << "\n");
+      }
+    });
   }
   
   // Step 2: Extract configuration from function attributes (set by SystolicTransform)
@@ -803,6 +860,45 @@ std::unique_ptr<Pass> createSystolicDataflowGenerationPass() {
 
 // Register the pass
 static PassRegistration<SystolicDataflowGenerationPass> passRegistration;
+
+//===----------------------------------------------------------------------===//
+// SystolicWriteReorderAnalysisPass - run before transform so store indices
+// (e.g. affine.apply) are still visible; attributes are preserved across transform.
+//===----------------------------------------------------------------------===//
+struct SystolicWriteReorderAnalysisPass
+    : public PassWrapper<SystolicWriteReorderAnalysisPass, OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SystolicWriteReorderAnalysisPass)
+  void runOnOperation() override {
+    func::FuncOp func = getOperation();
+    WriteTimeReorderingAnalyzer analyzer(func);
+    if (failed(analyzer.analyze()))
+      return;
+    for (const auto &pattern : analyzer.getPatterns()) {
+      if (!pattern.hasNonLinearAccess || pattern.reorderedDims.empty())
+        continue;
+      std::string dimsAttrName = "systolic.reorder." + pattern.arrayName + ".dims";
+      std::string permAttrName = "systolic.reorder." + pattern.arrayName + ".perm";
+      SmallVector<Attribute, 3> dimAttrs;
+      for (int64_t dim : pattern.reorderedDims)
+        dimAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 64), dim));
+      func->setAttr(dimsAttrName, ArrayAttr::get(func.getContext(), dimAttrs));
+      SmallVector<Attribute, 3> permAttrs;
+      for (unsigned perm : pattern.dimPermutation)
+        permAttrs.push_back(IntegerAttr::get(IntegerType::get(func.getContext(), 32), perm));
+      func->setAttr(permAttrName, ArrayAttr::get(func.getContext(), permAttrs));
+    }
+  }
+  StringRef getArgument() const override { return "systolic-write-reorder-analysis"; }
+  StringRef getDescription() const override {
+    return "Analyze write-time reordering and set systolic.reorder.* attributes (run before transform)";
+  }
+};
+
+static PassRegistration<SystolicWriteReorderAnalysisPass> writeReorderAnalysisRegistration;
+
+std::unique_ptr<Pass> createSystolicWriteReorderAnalysisPass() {
+  return std::make_unique<SystolicWriteReorderAnalysisPass>();
+}
 
 } // namespace systolic
 } // namespace mlir

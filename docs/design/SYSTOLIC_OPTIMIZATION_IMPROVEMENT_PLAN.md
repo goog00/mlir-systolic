@@ -107,14 +107,14 @@
 
 - [x] **读时重排**：在 `emitIOL3InSerialize` 中，当存在 2D reorder 属性时，按重排后的维度顺序 (d0,d1) 生成 DRAM 读循环（假定输入为重排布局，读仍顺序）。
 - [x] **写时重排**：在 `emitDrainSerialize` 中，当存在 reorder 属性时，按重排后的维度顺序生成 DRAM 写循环，实现写时重排。
-- [ ] **参数与选择范围**：与 AutoSA 对齐，参数（array_part、latency、simd 等）应由多面体分析逐步得到选择范围（tilable_loops、合法 spacetime 等）；当前可文档化“在合法范围内手动取小”的用法，后续增加分析输出可选范围的接口。
+- [x] **参数与选择范围（文档）**：已新增 [PARAMETER_SELECTION_AND_VALID_RANGE.md](PARAMETER_SELECTION_AND_VALID_RANGE.md)，说明“在合法范围内手动取小”及 AutoSA 参考；后续可增加分析输出可选范围的接口。
 - [x] **测试**：小规模 MM 端到端（opt → translate，参数对应当前输入合法范围）；已提供 `test/run_mm_e2e.sh` 做回归（检查生成 cpp 含 kernel0、PIPELINE、DATAFLOW、PE_wrapper 等）；可选 C sim / 综合待做。
 - [x] **文档**：将“参数来自分析范围”与“写时重排接入点”更新到本文档与 [CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md](../status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md)（见下文小规模配置表与写时重排接入清单）。
 
 ### Phase 2
 
 - [x] **4-loop（Transform 已放行）**：SystolicTransform 要求 band.size() ≥ 3（`applyMultiLevelTiling`），故 4-loop 已可通过；缺口在 DataflowGeneration 与 translate 对 4-loop/4 数组的模板与 reorder 支持。
-- [ ] **写时重排**：WriteTimeReorderingAnalyzer 与 DataflowGeneration 对 4 维数组的支持。
+- [x] **写时重排**：WriteTimeReorderingAnalyzer 已支持 2D/3D 数组；translate 端 drain 已增加 3D 重排路径（`hasReordering3D` + Phase 1/2/3）；若需 4 维数组可再扩展。
 - [x] **MTTKRP 模板（参数化数组名）**：translate 从 kernel 函数参数推导数组名（2 输入 + 1 输出），支持 A/B/D 等任意命名；4-loop 已跑通 opt→translate。
 - [x] **MTTKRP 小规模测例**：`test/minimal_mttkrp.mlir`（4-loop 8×8×8×8）+ `test/run_mttkrp_e2e.sh` 回归；L3/drain 仍用当前 2D 模板（3 数组共用），reorder 支持 2D。
 

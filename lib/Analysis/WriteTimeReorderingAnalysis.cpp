@@ -129,8 +129,15 @@ LogicalResult WriteTimeReorderingAnalyzer::analyze() {
         }
       }
       
-      patterns[patternIdx].storeOps.push_back(storeOp);
+      patterns[patternIdx].storeOps.push_back(storeOp.getOperation());
       patterns[patternIdx].storeMaps.push_back(storeOp.getAffineMap());
+      // Also collect apply maps for store indices (for write-time reorder detection)
+      for (Value idx : storeOp.getMapOperands()) {
+        if (auto applyOp = idx.getDefiningOp<AffineApplyOp>()) {
+          patterns[patternIdx].storeMaps.push_back(applyOp.getAffineMap());
+          LLVM_DEBUG(llvm::dbgs() << "Found affine.apply for store index: " << applyOp.getAffineMap() << "\n");
+        }
+      }
     }
   });
   
@@ -147,34 +154,69 @@ LogicalResult WriteTimeReorderingAnalyzer::analyze() {
 }
 
 LogicalResult WriteTimeReorderingAnalyzer::analyzePattern(ArrayAccessPattern &pattern) {
-  // Check if any load map contains non-linear expressions
+  // Check load and store maps for non-linear expressions (store matters for write-time reorder)
   for (auto loadMap : pattern.loadMaps) {
     if (hasNonLinearExpression(loadMap)) {
       pattern.hasNonLinearAccess = true;
       break;
     }
   }
+  if (!pattern.hasNonLinearAccess) {
+    for (auto storeMap : pattern.storeMaps) {
+      if (hasNonLinearExpression(storeMap)) {
+        pattern.hasNonLinearAccess = true;
+        break;
+      }
+    }
+  }
   
-  // If no non-linear access, no reordering needed
   if (!pattern.hasNonLinearAccess) {
     LLVM_DEBUG(llvm::dbgs() << "Array " << pattern.arrayName 
                             << " has no non-linear access, no reordering needed\n");
     return success();
   }
   
-  // Find which dimension has non-linear index
-  // For each load map, check each result expression
+  // Find which dimension has non-linear index (check load maps first by result index)
   for (auto loadMap : pattern.loadMaps) {
-    for (unsigned i = 0; i < loadMap.getNumResults(); i++) {
-      auto expr = loadMap.getResult(i);
-      if (isNonLinearExpr(expr)) {
-        pattern.nonLinearDim = i;
-        LLVM_DEBUG(llvm::dbgs() << "Found non-linear access in dimension " 
-                                << i << " for array " << pattern.arrayName << "\n");
+    for (unsigned i = 0; i < loadMap.getNumResults() && i < (unsigned)pattern.originalDims.size(); i++) {
+      if (isNonLinearExpr(loadMap.getResult(i))) {
+        pattern.nonLinearDim = (int)i;
+        LLVM_DEBUG(llvm::dbgs() << "Found non-linear load in dimension " << i << " for " << pattern.arrayName << "\n");
         break;
       }
     }
     if (pattern.nonLinearDim >= 0) break;
+  }
+  // If not found in loads, check store maps (and store op index operands from affine.apply)
+  if (pattern.nonLinearDim < 0) {
+    for (auto storeMap : pattern.storeMaps) {
+      for (unsigned i = 0; i < storeMap.getNumResults() && i < (unsigned)pattern.originalDims.size(); i++) {
+        if (isNonLinearExpr(storeMap.getResult(i))) {
+          pattern.nonLinearDim = (int)i;
+          LLVM_DEBUG(llvm::dbgs() << "Found non-linear store in dimension " << i << " for " << pattern.arrayName << "\n");
+          break;
+        }
+      }
+      if (pattern.nonLinearDim >= 0) break;
+    }
+  }
+  // Store index from affine.apply: apply map has 1 result; it corresponds to the store operand position
+  if (pattern.nonLinearDim < 0 && !pattern.storeOps.empty()) {
+    for (Operation *op : pattern.storeOps) {
+      auto storeOp = cast<AffineStoreOp>(op);
+      for (unsigned dim = 0; dim < storeOp.getMapOperands().size(); dim++) {
+        Value idx = storeOp.getMapOperands()[dim];
+        if (auto applyOp = idx.getDefiningOp<AffineApplyOp>()) {
+          AffineMap applyMap = applyOp.getAffineMap();
+          if (hasNonLinearExpression(applyMap)) {
+            pattern.nonLinearDim = (int)dim;
+            LLVM_DEBUG(llvm::dbgs() << "Found non-linear store (apply) in dimension " << dim << " for " << pattern.arrayName << "\n");
+            break;
+          }
+        }
+      }
+      if (pattern.nonLinearDim >= 0) break;
+    }
   }
   
   // Compute reordering using polyhedral analysis (Phase 2)
@@ -222,23 +264,31 @@ bool WriteTimeReorderingAnalyzer::isNonLinearExpr(AffineExpr expr) {
 }
 
 LogicalResult WriteTimeReorderingAnalyzer::computeReordering(ArrayAccessPattern &pattern) {
-  // For 3D arrays, move non-linear dimension to middle
-  if (pattern.originalDims.size() != 3) {
-    LLVM_DEBUG(llvm::dbgs() << "Reordering only supported for 3D arrays, "
-                            << "array " << pattern.arrayName 
-                            << " has " << pattern.originalDims.size() << " dimensions\n");
-    return success();  // Not an error, just not supported yet
-  }
-  
-  // Strategy: move non-linear dimension to middle position
-  // Original: [dim0][dim1][dim2]
-  // If non-linear at dim0: [dim1][dim0][dim2]
-  // If non-linear at dim2: [dim1][dim2][dim0]
-  // If non-linear at dim1: no change needed (already in middle)
-  
   pattern.reorderedDims.clear();
   pattern.dimPermutation.clear();
-  
+  size_t n = pattern.originalDims.size();
+
+  // 2D: swap so non-linear dim is last for stride-1 write
+  if (n == 2) {
+    if (pattern.nonLinearDim == 0) {
+      pattern.reorderedDims = {pattern.originalDims[1], pattern.originalDims[0]};
+      pattern.dimPermutation = {1, 0};
+    } else {
+      pattern.reorderedDims = pattern.originalDims;
+      pattern.dimPermutation = {0, 1};
+    }
+    LLVM_DEBUG(llvm::dbgs() << "Computed 2D reordering for " << pattern.arrayName
+                            << ": [" << pattern.originalDims[0] << "," << pattern.originalDims[1]
+                            << "] -> [" << pattern.reorderedDims[0] << "," << pattern.reorderedDims[1] << "]\n");
+    return success();
+  }
+
+  if (n != 3) {
+    LLVM_DEBUG(llvm::dbgs() << "Reordering only for 2D/3D; array " << pattern.arrayName << " has " << n << " dims\n");
+    return success();
+  }
+
+  // 3D: move non-linear dimension to middle
   if (pattern.nonLinearDim == 0) {
     // Move first to middle: [0,1,2] -> [1,0,2]
     pattern.reorderedDims = {
@@ -261,28 +311,16 @@ LogicalResult WriteTimeReorderingAnalyzer::computeReordering(ArrayAccessPattern 
     pattern.dimPermutation = {0, 1, 2};
   }
   
-  LLVM_DEBUG(llvm::dbgs() << "Computed reordering for " << pattern.arrayName 
-                          << ": [" << pattern.originalDims[0] << "][" 
-                          << pattern.originalDims[1] << "][" 
-                          << pattern.originalDims[2] << "] -> ["
-                          << pattern.reorderedDims[0] << "]["
-                          << pattern.reorderedDims[1] << "]["
-                          << pattern.reorderedDims[2] << "]\n");
-  
+  LLVM_DEBUG(llvm::dbgs() << "Computed 3D reordering for " << pattern.arrayName
+                          << ": [" << pattern.originalDims[0] << "," << pattern.originalDims[1] << "," << pattern.originalDims[2]
+                          << "] -> [" << pattern.reorderedDims[0] << "," << pattern.reorderedDims[1] << "," << pattern.reorderedDims[2] << "]\n");
   return success();
 }
 
 LogicalResult WriteTimeReorderingAnalyzer::computeReorderingWithISL(ArrayAccessPattern &pattern) {
-  // Phase 2: Use polyhedral analysis to compute optimal reordering
-  // 1. Analyze access patterns (stride, reuse distance, randomness)
-  // 2. Evaluate all layout permutations
-  // 3. Select optimal layout based on cost and locality
-  
   if (pattern.originalDims.size() != 3) {
-    LLVM_DEBUG(llvm::dbgs() << "Polyhedral analysis only supported for 3D arrays, "
-                            << "array " << pattern.arrayName 
-                            << " has " << pattern.originalDims.size() << " dimensions\n");
-    // Fall back to simple heuristic
+    LLVM_DEBUG(llvm::dbgs() << "Polyhedral analysis only for 3D; array " << pattern.arrayName
+                            << " has " << pattern.originalDims.size() << " dims, using heuristic\n");
     return computeReordering(pattern);
   }
   

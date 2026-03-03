@@ -1094,6 +1094,7 @@ void registerSystolicPasses() {
   // is linked, we explicitly reference the create function to prevent
   // the linker from removing the unused symbol.
   (void)createSystolicDataflowGenerationPass();
+  (void)createSystolicWriteReorderAnalysisPass();
   // SystolicDataflowToHLSPass is registered in its own file
 }
 

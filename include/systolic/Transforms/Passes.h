@@ -45,6 +45,10 @@ std::unique_ptr<Pass> createIOModuleGenerationPass();
 /// AutoSA: sa_io_construct_optimize, generate_hw_modules
 std::unique_ptr<Pass> createSystolicDataflowGenerationPass();
 
+/// Run write-time reordering analysis and set systolic.reorder.* attributes.
+/// Must run before systolic-transform so store indices (e.g. affine.apply) are visible.
+std::unique_ptr<Pass> createSystolicWriteReorderAnalysisPass();
+
 /// Create a pass that lowers SystolicDataflow Dialect to HLS Dialect.
 /// This converts high-level systolic abstractions to concrete HLS structures.
 std::unique_ptr<Pass> createSystolicDataflowToHLSPass();
