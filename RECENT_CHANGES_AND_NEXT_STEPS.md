@@ -13,6 +13,32 @@
 - **新增设计结论文档**：见 [docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md)，包含 AutoSA 与当前生成逻辑差异、以及分阶段通用化路线（`mttkrp` 先行、`ttmc` 次之）。
 - **回归基线状态**：`test/run_all_e2e.sh` 保持可回归；其中标准 `ttmc` / 3D reorder 相关脚本在当前阶段按“命中预期不支持错误即通过”判定。
 
+### 双规约 PE 路径（num_time_loops ≥ 2）
+
+- **语义属性**：`SystolicTransform` 在 kernel 上写入 `systolic.num_time_loops`；`systolic-translate` 读入后填入 `ContractionDesc.numReductions`，用于区分单规约（MM）与双规约（标准 MTTKRP）。
+- **PE 双规约循环**：当 `contraction.numReductions >= 2` 时，在 PE 的 c2 与 c5 之间插入第二规约维循环 `r1`（0..size-1）；累加器在 `r1==0 && c2==0 && c5==0` 时清零，在 `r1==size-1 && c2==numTiles-1 && c5==c5Bound-1` 时写出，使每输出点完成 K×L 次累加（如 8×8=64）。
+- **IO 与 FIFO 对齐**：为保持 DATAFLOW 下 FIFO 读写一致，在双规约时对以下模块同样增加 r1 循环（或 r1 次调用）：`emitDummyModules`、`emitIOL2In`、`emitIOL2InBoundary`、`emitIOL3In`、`emitIOL3InSerialize`（coalesced 分支）。
+- **L3_serialize 按输入维度区分 3D/2D**：emitter 增加 `inputShapes`（由 kernel 的 memref 参数形状填充），并传入 `emitIOL3InSerialize`。双规约且该输入为 **3D**（如 MTTKRP 的 A[I,K,L]）时，coalesced 分支按 **r1 = 第三维切片** 读 DRAM：`word_idx = r1 * wordsPerPlane + (c0,c1,c3,c4g)`，其中 `wordsPerPlane = (dim0*dim1*4)/64`，使每个 r1 读到不同平面。2D 输入（B、C）仍按原公式（同一数据可被下游按 r1 重复使用）。
+- **ContractionDesc 驱动 PE 条件**：`ContractionDesc` 增加 `hasExtraReductionLoop()`（即 `numReductions >= 2`）；emitter 中所有“双规约”分支统一用该接口。PE 的累加器清零与写出条件由 `emitPEInitCondition()` / `emitPEDrainCondition()` 根据 `contraction` 生成，便于后续扩展更多规约维。
+- **ContractionDesc.Kind 与 rank-3 输出**：`ContractionDesc` 增加 `Kind`（MatmulLike / MttkrpLike / TtmcLike / Unsupported）。根据 `outputRank` 与 `num_time_loops` 设置；仅当 `Kind::Unsupported` 时报错（rank>3，或 rank-3 且 num_time_loops>2）。emitter 增加 `outputShape`，用于 drain serialize。**rank-3 且无写时重排**时，`emitDrainSerialize` 走 3D 顺序写回路径（fifo 顺序 = row-major i,j,k）。TTMc 当前为 5 循环、num_time_loops=3，仍视为 Unsupported，e2e 保持“预期失败”；后续支持 3 规约维后可改为 TtmcLike 并生成完整 3D 输出。
+- **验证**：`run_all_e2e.sh` 全量通过（MM 单规约、标准 MTTKRP 双规约路径、写时重排 2D/3D、TTMc 预期失败）。
+- **Transform 与 4 循环**：① **spaceTimeMode -1 视为 3**：调用 selectSpaceLoops 前将 -1 规范为 legacyMode=3（[i,j] 2D），避免 default 失败。② **4+ 循环 time = 剩余**：legacy selectSpaceLoops 中 time 改为“所有非 space 的循环”，故 4 循环得 space [0,1]、time [2,3]，num_time_loops=2。③ **num_time_loops 提前设置**：在 space-time 选择成功后、tiling 之前即写 `systolic.num_time_loops`，这样 tiling 失败（如 size=8 与默认 array_part=16）时 translate 仍能读到双规约。④ **4 循环不进入 tiling**：applyMultiLevelTiling 在 band.size()>3 时直接 failure，避免 4 维时 latency/arrayPart 越界；Level2 的 tileSizes2 对 i>=latency.size() 且 i>=arrayPart.size() 时用 1。
+- **排错策略**：现阶段**先在本地开发**，通过**分析生成 HLS 文件内容**做初步排错；阶段性工作结束后再**统一在服务器上进行 HLS/csim 测试与具体调错**。本地可借助 [test/inspect_generated.sh](test/inspect_generated.sh) 与下方「生成文件本地检查清单」做快速自检。
+
+### 生成文件本地检查清单
+
+在未跑 HLS 的环境下，可通过以下方式对生成 `.cpp` 做初步自检（生成文件一般在 `/tmp/*_e2e_out.cpp`，由各 e2e 脚本写出）：
+
+| 检查项 | 含义 | 建议 |
+|--------|------|------|
+| 出现 `r1` | 双规约路径是否生效（MTTKRP 应有，MM 通常无） | MTTKRP_std 生成中应有 r1；若为 0 可检查中间 MLIR 是否带 `systolic.num_time_loops` 及 kernel 选择 |
+| `word_idx.*r1` | L3_serialize 对 3D 输入是否按 r1 切片读 | 仅 3D 输入（如 MTTKRP 的 A）对应模块应有 |
+| 注释 `r1 = plane` | 3D 数组按平面读的注释 | 同上 |
+| `buffer_linear` | 写时重排路径是否生效 | 写时重排测例生成中应有 |
+| `PIPELINE II=1` / `DATAFLOW` | 基本 HLS pragma 是否存在 | 各 kernel 生成中应有 |
+
+运行 `./test/inspect_generated.sh` 会先执行全量 e2e，再对上述模式做计数并打印，便于快速确认结构是否符合预期。HLS csim/综合留待阶段性工作结束后在服务器统一进行。
+
 ---
 
 ## 工作区与文档整理说明

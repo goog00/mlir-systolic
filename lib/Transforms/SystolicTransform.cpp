@@ -475,44 +475,40 @@ static LogicalResult selectSpaceLoops(
     return failure();
   }
   
-  // AutoSA space-time modes for 3-loop case (i=0, j=1, k=2):
+  // AutoSA space-time modes: space loops for 3-loop (i=0,j=1,k=2); time = rest for 4+ loops
   switch (spaceTimeMode) {
     case 0:  // [i] - 1D row array
       spaceLoopIndices.push_back(0);
-      timeLoopIndices.push_back(1);
-      timeLoopIndices.push_back(2);
       break;
     case 1:  // [j] - 1D column array
       spaceLoopIndices.push_back(1);
-      timeLoopIndices.push_back(0);
-      timeLoopIndices.push_back(2);
       break;
     case 2:  // [k] - 1D reduction array
       spaceLoopIndices.push_back(2);
-      timeLoopIndices.push_back(0);
-      timeLoopIndices.push_back(1);
       break;
-    case 3:  // [i,j] - 2D output-stationary (default)
+    case 3:  // [i,j] - 2D output-stationary (default), MTTKRP 4-loop: time = [k,l]
       spaceLoopIndices.push_back(0);
       spaceLoopIndices.push_back(1);
-      timeLoopIndices.push_back(2);
       break;
     case 4:  // [i,k] - 2D with horizontal reduction
       spaceLoopIndices.push_back(0);
       spaceLoopIndices.push_back(2);
-      timeLoopIndices.push_back(1);
       break;
     case 5:  // [j,k] - 2D with vertical reduction
       spaceLoopIndices.push_back(1);
       spaceLoopIndices.push_back(2);
-      timeLoopIndices.push_back(0);
       break;
     default:
-      LLVM_DEBUG(llvm::dbgs() << "[Systolic] Invalid space-time mode: " 
+      LLVM_DEBUG(llvm::dbgs() << "[Systolic] Invalid space-time mode: "
                               << spaceTimeMode << "\n");
       return failure();
   }
-  
+  // Time loops = all indices not in space (supports 4+ loops, e.g. MTTKRP k,l)
+  std::set<unsigned> spaceSet(spaceLoopIndices.begin(), spaceLoopIndices.end());
+  for (unsigned i = 0; i < numLoops; ++i)
+    if (spaceSet.find(i) == spaceSet.end())
+      timeLoopIndices.push_back(i);
+
   // Verify selected space loops have distance <= 1
   for (unsigned idx : spaceLoopIndices) {
     if (idx >= depInfos.size()) {
@@ -633,7 +629,13 @@ static LogicalResult applyMultiLevelTiling(
     LLVM_DEBUG(llvm::dbgs() << "[Systolic] Need at least 3 loops for tiling\n");
     return failure();
   }
-  
+  if (band.size() > 3) {
+    // Tiling and downstream (e.g. applyFinalPermutation) assume at most 3 loops; skip to avoid OOB.
+    // num_time_loops is already set before tiling for 4+ loop kernels (e.g. MTTKRP, 3D reorder).
+    LLVM_DEBUG(llvm::dbgs() << "[Systolic] Skip tiling for " << band.size() << " loops (max 3)\n");
+    return failure();
+  }
+
   // Level 1: Array Partitioning
   SmallVector<int64_t, 3> tileSizes1;
   for (unsigned i = 0; i < std::min((size_t)band.size(), options.arrayPart.size()); ++i) {
@@ -677,9 +679,11 @@ static LogicalResult applyMultiLevelTiling(
   for (unsigned i = 0; i < pointLoops.size(); ++i) {
     if (i < options.latency.size()) {
       tileSizes2.push_back(options.latency[i]);
-    } else {
-      // For non-space loops (e.g., k), use full tile size (no latency tiling)
+    } else if (i < options.arrayPart.size()) {
       tileSizes2.push_back(options.arrayPart[i]);
+    } else {
+      // Extra loops (e.g. 4th in MTTKRP): no further tiling
+      tileSizes2.push_back(1);
     }
   }
   
@@ -947,7 +951,7 @@ struct SystolicTransformPass
     
     for (auto &band : bands) {
       LLVM_DEBUG(llvm::dbgs() << "\nProcessing band with " << band.size() << " loops\n");
-      
+
       // Step 2.1: Legality check (AutoSA: sa_legality_check)
       if (failed(checkLegality(band))) {
         LLVM_DEBUG(llvm::dbgs() << "Legality check failed, skipping band\n");
@@ -976,20 +980,22 @@ struct SystolicTransformPass
       SmallVector<unsigned, 2> spaceLoops;
       SmallVector<unsigned, 3> timeLoops;
       
+      // Normalize spaceTimeMode: -1 or out-of-range means default mode 3 ([i,j] 2D)
+      int mode = options.spaceTimeMode;
+      unsigned legacyMode = (mode >= 0 && mode <= 5) ? (unsigned)mode : 3u;
       // Create parametric configuration based on spaceTimeMode
-      ParametricSpaceTime parametricConfig = 
-        ParametricSpaceTime::createFromMode(options.spaceTimeMode);
-      
+      ParametricSpaceTime parametricConfig =
+        ParametricSpaceTime::createFromMode(legacyMode);
+
       // Use parametric version for loop selection if available
       // This replaces hardcoded [0,1]/[2..] assumptions
       if (parametricConfig.isValid()) {
         if (failed(selectSpaceLoopsParametric(depInfos, parametricConfig,
                                               spaceLoops, timeLoops))) {
-          LLVM_DEBUG(llvm::dbgs() 
+          LLVM_DEBUG(llvm::dbgs()
               << "Parametric space loop selection failed, "
               << "falling back to legacy mode\n");
-          // Fallback to legacy mode
-          if (failed(selectSpaceLoops(depInfos, options.spaceTimeMode,
+          if (failed(selectSpaceLoops(depInfos, legacyMode,
                                       spaceLoops, timeLoops))) {
             LLVM_DEBUG(llvm::dbgs() << "Space loop selection failed\n");
             continue;
@@ -997,13 +1003,19 @@ struct SystolicTransformPass
         }
       } else {
         // Fallback to legacy mode if parametric config is invalid
-        if (failed(selectSpaceLoops(depInfos, options.spaceTimeMode,
+        if (failed(selectSpaceLoops(depInfos, legacyMode,
                                     spaceLoops, timeLoops))) {
           LLVM_DEBUG(llvm::dbgs() << "Space loop selection failed\n");
           continue;
         }
       }
-      
+
+      // Set num_time_loops early so translate gets it even if tiling fails (e.g. size 8 vs default array_part 16)
+      int64_t numTimeLoops = static_cast<int64_t>(timeLoops.size());
+      func->setAttr("systolic.num_time_loops",
+                    OpBuilder(func.getContext()).getI64IntegerAttr(numTimeLoops));
+      LLVM_DEBUG(llvm::dbgs() << "[Systolic] Set num_time_loops=" << numTimeLoops << "\n");
+
       // Step 2.5: Permute loops (space loops to outer positions)
       // Note: For now, we skip permutation before tiling if already in order
       // This matches AutoSA's behavior for [i,j] mode on MatMul
@@ -1046,7 +1058,11 @@ struct SystolicTransformPass
       // Store space-time mode
       func->setAttr("systolic.space_time_mode", 
                     builder.getI32IntegerAttr(options.spaceTimeMode));
-      
+
+      // num_time_loops already set above before tiling; update if we want to keep in sync
+      func->setAttr("systolic.num_time_loops",
+                    builder.getI64IntegerAttr(static_cast<int64_t>(timeLoops.size())));
+
       LLVM_DEBUG(llvm::dbgs() << "[Systolic] Stored configuration:\n");
       LLVM_DEBUG(llvm::dbgs() << "  array_part: [" 
                               << options.arrayPart[0] << ", "
