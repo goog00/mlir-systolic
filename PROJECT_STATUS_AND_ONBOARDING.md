@@ -1,7 +1,7 @@
 # mlir-systolic 项目状态与上手指南
 
 > **用途**：在新环境（例如服务器）或新 Agent 接手时，快速了解当前做了什么、如何验证、下一步该做什么。  
-> **最后更新**：2026-03
+> **最后更新**：2026-03-04
 
 ---
 
@@ -13,6 +13,13 @@
   - **Pass 链**：`systolic-write-reorder-analysis`（可选）→ `systolic-transform` → `systolic-dataflow-generation` → 生成 SystolicDataflow IR；再由 **systolic-translate** 生成 HLS C++。
   - **支持的 kernel**：MM（矩阵乘）、MTTKRP（4 循环）、写时重排 2D/3D 测例；模板支持最多 3 输入 + 1 输出。
   - **已做优化**：写时重排（2D/3D）、读时重排（2D）、L3 coalesced 读（tile 顺序 + word_idx）、FIFO 深度可配置、RESOURCE 系统化（FIFO_SRL/RAM_2P_BRAM）、Pipeline 内 %/ 强度削减（2 的幂时用位运算）、L2 声明/定义维度一致。
+
+### 当前阶段结论（2026-03-04）
+
+- **目标收敛**：从“先比性能”切换为“先语义正确（csim）”。
+- **标准 MTTKRP**：已建立标准语义用例并复现 csim mismatch，详见 `hls_validation/mttkrp_std_mlirsystolic/CSIM_FINDINGS_2026-03-04.md`。
+- **标准 TTMc**：当前仍受 rank-3 输出模板能力限制；translate 中对非 2D 输出已做保护性拦截。
+- **设计路线**：已形成对比与通用化方案，详见 [docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md)。
 
 ---
 

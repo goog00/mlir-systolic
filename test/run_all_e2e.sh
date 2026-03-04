@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 全量端到端测试：依次执行 MM、MTTKRP、写时重排 三个 e2e 脚本，汇总结果。
+# 全量端到端测试：依次执行 MM、MTTKRP、标准语义 MTTKRP/TTMc、写时重排 e2e 脚本，汇总结果。
 # 用法: ./test/run_all_e2e.sh
 # 依赖: 先构建 build (e.g. ./scripts/build-systolic.sh)
 
@@ -32,6 +32,7 @@ run_one() {
 echo "========== mlir-systolic 全量 e2e 测试 =========="
 run_one "MM"           "$SCRIPT_DIR/run_mm_e2e.sh"            || true
 run_one "MTTKRP"       "$SCRIPT_DIR/run_mttkrp_e2e.sh"        || true
+run_one "标准语义TTMc"   "$SCRIPT_DIR/run_ttmc_std_e2e.sh"      || true
 run_one "写时重排(2D)" "$SCRIPT_DIR/run_reorder_e2e.sh"       || true
 run_one "写时重排(3D)" "$SCRIPT_DIR/run_reorder_3d_e2e.sh"    || true
 

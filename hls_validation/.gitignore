@@ -1,0 +1,15 @@
+# Keep validation workspace lightweight in git:
+# - track only conclusions/reports (.md)
+# - ignore generated kernels/reports/scripts/projects by default
+*
+!*/
+!*.md
+!.gitignore
+
+# Explicit transient patterns (for readability)
+*_prj/
+*_csim_prj/
+**/vivado_hls.app
+**/.autopilot/
+**/.Xil/
+*.log

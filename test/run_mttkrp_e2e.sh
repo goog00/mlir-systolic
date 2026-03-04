@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# 4-loop MTTKRP 端到端：opt -> translate，检查生成 HLS 存在且含关键符号。
-# 参数应对应当前输入合法范围（8x8x8 等小规模）。
+# 标准语义 MTTKRP 端到端：opt -> translate，检查生成 HLS 存在且含关键符号。
+# 语义：D(i,j) += A(i,k,l) * B(k,j) * C(l,j)
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
-INPUT="${1:-$REPO_ROOT/test/minimal_mttkrp.mlir}"
+INPUT="${1:-$REPO_ROOT/test/minimal_mttkrp_std.mlir}"
 OUT_MLIR="${2:-/tmp/mttkrp_e2e_out.mlir}"
 OUT_CPP="${3:-/tmp/mttkrp_e2e_out.cpp}"
 
@@ -41,10 +41,11 @@ grep -q "PIPELINE" "$OUT_CPP" || MISSING="${MISSING} PIPELINE"
 grep -q "DATAFLOW" "$OUT_CPP" || MISSING="${MISSING} DATAFLOW"
 grep -q "PE_wrapper" "$OUT_CPP" || MISSING="${MISSING} PE_wrapper"
 grep -q "drain_IO_L3_out_serialize" "$OUT_CPP" || MISSING="${MISSING} drain_IO_L3_out_serialize"
+grep -q "arg2_IO_L3_in" "$OUT_CPP" || MISSING="${MISSING} third_input_path"
 
 if [[ -n "$MISSING" ]]; then
   echo "FAIL: missing in $OUT_CPP:$MISSING"
   exit 1
 fi
 
-echo "PASS: MTTKRP 4-loop e2e opt->translate; output: $OUT_CPP"
+echo "PASS: Standard MTTKRP e2e opt->translate; output: $OUT_CPP"

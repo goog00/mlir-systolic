@@ -431,7 +431,7 @@ void SystolicHLSEmitter::emitIOL2InIntraTrans(StringRef arrayName) {
   os << "          " << arrayName << "_t1 out_data;\n";
   
   // 应用维度置换到数组访问
-  SmallVector<std::string, 3> originalIdx = {"c7", "0", "c5"};
+  SmallVector<std::string, 3> originalIdx = {"c7", "0", "0"};
   SmallVector<std::string, 3> permutedIdx = applyAccessPermutation(arrayName, originalIdx);
   os << "          in_data = local_" << arrayName << "[" << permutedIdx[0] << "]["
      << permutedIdx[1] << "][" << permutedIdx[2] << "];\n";
@@ -725,6 +725,8 @@ void SystolicHLSEmitter::emitPE() {
   os << "              {\n";
   for (const auto &in : inputNames)
     os << "                local_" << in << "[0][0] = fifo_" << in << "_in.read();\n";
+  os << "                if (c2 == 0 && c5 == 0)\n";
+  os << "                  local_" << out << "[c7][c6] = 0;\n";
   os << "                local_" << out << "[c7][c6] = (local_" << out << "[c7][c6] + (";
   for (size_t i = 0; i < inputNames.size(); i++)
     os << (i ? " * " : "") << "local_" << inputNames[i] << "[0][0]";
@@ -1675,6 +1677,24 @@ LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
       kernelFunc = *funcOps.begin();
     extractReorderingInfo(kernelFunc);
     deriveArrayNamesFromFunction(kernelFunc);
+
+    SmallVector<MemRefType, 4> memrefArgs;
+    for (unsigned i = 0; i < kernelFunc.getNumArguments(); i++) {
+      if (auto memrefTy = kernelFunc.getArgument(i).getType().dyn_cast<MemRefType>())
+        memrefArgs.push_back(memrefTy);
+    }
+    if (!memrefArgs.empty()) {
+      auto outTy = memrefArgs.back();
+      if (outTy.getRank() != 2) {
+        llvm::errs() << "systolic-translate error: unsupported output rank "
+                     << outTy.getRank()
+                     << ". Current backend supports rank-2 output tensors only.\n";
+        llvm::errs() << "  Function: " << kernelFunc.getName() << "\n";
+        llvm::errs() << "  Hint: current generated PE/dataflow template is matrix-style and cannot correctly lower rank-"
+                     << outTy.getRank() << " output kernels yet.\n";
+        return failure();
+      }
+    }
   } else {
     inputNames.assign({"A", "B"});
     outputName = "C";

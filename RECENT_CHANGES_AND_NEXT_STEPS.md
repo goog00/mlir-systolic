@@ -1,7 +1,17 @@
 # 近期修改与下一步工作
 
-> **更新日期**: 2026-03-02  
+> **更新日期**: 2026-03-04  
 > 本文档记录本轮开发中的主要修改，并链到已有文档与后续计划。
+
+---
+
+## 0. 2026-03-04 语义正确性结论（新增）
+
+- **当前优先级已切换为语义正确性**：先让标准语义 `mttkrp/ttmc` 正确，再做性能对比。
+- **标准 MTTKRP（2D 输出）已复现 csim 失败**：`hls_validation/mttkrp_std_mlirsystolic/CSIM_FINDINGS_2026-03-04.md` 记录了稳定可复现的 mismatch（典型 `hw=8, ref=64`），说明当前 PE 规约骨架尚未覆盖双规约语义。
+- **TTMc（3D 输出）当前不支持**：`systolic-translate` 已加入保护性校验，输出 rank 非 2 时直接报错，避免继续生成语义错误代码。
+- **新增设计结论文档**：见 [docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md)，包含 AutoSA 与当前生成逻辑差异、以及分阶段通用化路线（`mttkrp` 先行、`ttmc` 次之）。
+- **回归基线状态**：`test/run_all_e2e.sh` 保持可回归；其中标准 `ttmc` / 3D reorder 相关脚本在当前阶段按“命中预期不支持错误即通过”判定。
 
 ---
 
