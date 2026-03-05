@@ -212,6 +212,122 @@ static LogicalResult analyzeDependenceDistances(
 }
 
 //===----------------------------------------------------------------------===//
+// MLIR-Based Dependence Distance Analysis
+// Uses MLIR's affine analysis (getDependenceComponents) for accurate results.
+// This must be called BEFORE ExtractScopStmt, which moves affine ops out of
+// the loop nest into separate scop.stmt functions.
+//===----------------------------------------------------------------------===//
+
+/// Compute dependence distances using MLIR's built-in affine analysis.
+/// This directly analyzes affine.load/affine.store pairs in the loop nest
+/// using checkMemrefAccessDependence to get per-dimension distance vectors.
+static LogicalResult computeMLIRDependences(
+    LoopBand &band,
+    SmallVectorImpl<LoopDepInfo> &depInfos) {
+
+  depInfos.clear();
+  unsigned numLoops = band.size();
+  if (numLoops == 0)
+    return failure();
+
+  // Initialize distance info for each loop dimension.
+  // Start with min=0, max=0 (no dependence baseline).
+  for (unsigned i = 0; i < numLoops; ++i) {
+    LoopDepInfo info;
+    info.loopIndex = i;
+    info.minDistance = 0;
+    info.maxDistance = 0;
+    info.isUniform = true;
+    info.canBeSpaceLoop = true;
+    depInfos.push_back(info);
+  }
+
+  // Collect all memory access operations in the innermost loop body
+  SmallVector<Operation *, 16> loadStoreOps;
+  band.back().walk([&](Operation *op) {
+    if (isa<AffineLoadOp, AffineStoreOp>(op))
+      loadStoreOps.push_back(op);
+  });
+
+  if (loadStoreOps.empty()) {
+    LLVM_DEBUG(llvm::dbgs()
+        << "[Systolic] No affine load/store ops found in loop nest\n");
+    return failure();
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "[Systolic] MLIR dep analysis: "
+                          << loadStoreOps.size() << " memory ops, "
+                          << numLoops << " loops\n");
+
+  // Check all pairs: RAW (store->load), WAW (store->store), WAR (load->store)
+  // For each pair with a dependence, extract per-dimension distance bounds.
+  unsigned depCount = 0;
+  for (unsigned si = 0; si < loadStoreOps.size(); ++si) {
+    for (unsigned di = 0; di < loadStoreOps.size(); ++di) {
+      if (si == di)
+        continue;
+
+      Operation *srcOp = loadStoreOps[si];
+      Operation *dstOp = loadStoreOps[di];
+
+      // Skip RAR (both loads) unless we want to track them
+      bool srcIsStore = isa<AffineStoreOp>(srcOp);
+      bool dstIsStore = isa<AffineStoreOp>(dstOp);
+      if (!srcIsStore && !dstIsStore)
+        continue;
+
+      MemRefAccess srcAccess(srcOp);
+      MemRefAccess dstAccess(dstOp);
+
+      // Only check accesses to the same memref
+      if (srcAccess.memref != dstAccess.memref)
+        continue;
+
+      SmallVector<DependenceComponent, 2> depComps;
+      DependenceResult result = checkMemrefAccessDependence(
+          srcAccess, dstAccess, numLoops,
+          /*dependenceConstraints=*/nullptr,
+          &depComps);
+
+      if (hasDependence(result)) {
+        depCount++;
+        for (unsigned dim = 0;
+             dim < std::min((size_t)numLoops, depComps.size()); ++dim) {
+          const auto &comp = depComps[dim];
+          if (comp.lb.has_value()) {
+            depInfos[dim].minDistance =
+                std::min(depInfos[dim].minDistance, *comp.lb);
+          } else {
+            // Unknown lower bound: conservatively unbounded
+            depInfos[dim].minDistance = INT64_MIN;
+          }
+          if (comp.ub.has_value()) {
+            depInfos[dim].maxDistance =
+                std::max(depInfos[dim].maxDistance, *comp.ub);
+          } else {
+            // Unknown upper bound: conservatively unbounded
+            depInfos[dim].maxDistance = INT64_MAX;
+          }
+        }
+      }
+    }
+  }
+
+  LLVM_DEBUG(llvm::dbgs() << "[Systolic] MLIR dep analysis found "
+                          << depCount << " dependences\n");
+
+  // Finalize: compute isUniform and canBeSpaceLoop
+  for (auto &info : depInfos) {
+    info.isUniform = (info.minDistance == info.maxDistance);
+    // AutoSA criterion: space loops have dependence distance in [-1, 1]
+    info.canBeSpaceLoop =
+        (info.minDistance >= -1 && info.maxDistance <= 1);
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Dynamic Space-Time Configuration Enumeration
 //===----------------------------------------------------------------------===//
 
@@ -858,7 +974,55 @@ struct SystolicTransformPass
     llvm::dbgs() << "[Systolic Debug] Polymer is available\n";
     llvm::errs() << "[Systolic] Polymer is AVAILABLE - proceeding with transformation\n";
     
-    // Step 0: Preprocess function with ExtractScopStmt if needed
+    // Step 0a: Compute dependence distances using MLIR's affine analysis
+    // BEFORE ExtractScopStmt, because that pass moves affine load/store ops
+    // into separate scop.stmt functions where MLIR's pairwise analysis
+    // can no longer see them in the loop nest context.
+    SmallVector<SmallVector<LoopDepInfo, 4>, 4> precomputedDepInfos;
+    {
+      SmallVector<LoopBand, 4> preBands;
+      func.walk([&](AffineForOp forOp) {
+        if (!forOp->getParentOfType<AffineForOp>()) {
+          LoopBand band;
+          AffineForOp current = forOp;
+          while (current) {
+            band.push_back(current);
+            AffineForOp inner = nullptr;
+            for (auto &op : *current.getBody()) {
+              if (auto nestedFor = dyn_cast<AffineForOp>(op))
+                inner = nestedFor;
+            }
+            current = inner;
+          }
+          if (!band.empty())
+            preBands.push_back(band);
+        }
+      });
+
+      for (auto &band : preBands) {
+        SmallVector<LoopDepInfo, 4> depInfos;
+        if (succeeded(computeMLIRDependences(band, depInfos))) {
+          precomputedDepInfos.push_back(std::move(depInfos));
+          llvm::errs() << "[Systolic] MLIR dep analysis OK for band ("
+                       << band.size() << " loops):\n";
+          for (auto &d : depInfos) {
+            llvm::errs() << "  loop=" << d.loopIndex
+                         << " min=" << d.minDistance
+                         << " max=" << d.maxDistance
+                         << " uniform=" << (d.isUniform ? "y" : "n")
+                         << " space?=" << (d.canBeSpaceLoop ? "y" : "n")
+                         << "\n";
+          }
+        } else {
+          // Push empty to keep index alignment
+          precomputedDepInfos.push_back({});
+          llvm::errs() << "[Systolic] MLIR dep analysis failed for band ("
+                       << band.size() << " loops)\n";
+        }
+      }
+    }
+
+    // Step 0b: Preprocess function with ExtractScopStmt if needed
     // This is required by Polymer's createIslFromFuncOp
     mlir::ModuleOp module = cast<mlir::ModuleOp>(func->getParentOp());
     
@@ -961,18 +1125,33 @@ struct SystolicTransformPass
       // Step 2.2: Infer problem size
       ProblemSize problemSize = inferProblemSize(band);
       
-      // Step 3: Dependence analysis (AutoSA: get_dep_dis_at_node)
-      // REQUIRES Polymer - no fallback
+      // Step 3: Dependence analysis
+      // Use pre-computed MLIR dependence distances (computed before ExtractScopStmt).
+      // Fall back to Polymer-based analysis if MLIR results are unavailable.
       SmallVector<LoopDepInfo, 4> depInfos;
-      if (failed(analyzeDependenceDistances(func, band, depInfos))) {
-        LLVM_DEBUG(llvm::dbgs() << "Dependence analysis failed\n");
-        llvm::errs() << "[Systolic] Dependence analysis FAILED\n";
-        continue;
+      unsigned bandIdx = &band - &bands[0];
+      if (bandIdx < precomputedDepInfos.size() &&
+          !precomputedDepInfos[bandIdx].empty()) {
+        depInfos = precomputedDepInfos[bandIdx];
+        llvm::errs() << "[Systolic] Using pre-computed MLIR deps, count="
+                     << depInfos.size() << "\n";
+      } else {
+        // Fallback: try Polymer-based analysis (may have sentinel values)
+        if (failed(analyzeDependenceDistances(func, band, depInfos))) {
+          LLVM_DEBUG(llvm::dbgs() << "Dependence analysis failed\n");
+          llvm::errs() << "[Systolic] Dependence analysis FAILED\n";
+          continue;
+        }
+        llvm::errs() << "[Systolic] Using Polymer deps (fallback), count="
+                     << depInfos.size() << "\n";
       }
-      llvm::errs() << "[Systolic] Dependence analysis OK, deps=" << depInfos.size() << "\n";
       for (auto &d : depInfos) {
-        llvm::errs() << "  loop=" << d.loopIndex << " min=" << d.minDistance << " max=" << d.maxDistance
-                     << " uniform=" << (d.isUniform?"y":"n") << " space?=" << (d.canBeSpaceLoop?"y":"n") << "\n";
+        llvm::errs() << "  loop=" << d.loopIndex
+                     << " min=" << d.minDistance
+                     << " max=" << d.maxDistance
+                     << " uniform=" << (d.isUniform ? "y" : "n")
+                     << " space?=" << (d.canBeSpaceLoop ? "y" : "n")
+                     << "\n";
       }
       
       // Step 2.4: Select space and time loops (AutoSA: sa_space_time_transform)
