@@ -51,17 +51,15 @@
 
 ## 4. 改进阶段划分
 
-### Phase 1：写时重排与 MM 小规模闭环（当前周期）
+### Phase 1：写时重排与 MM 小规模闭环（已完成）
 
 **目标**：写时重排分析结果**完整接入代码生成**；MM 在小规模下可端到端跑通并可用于审查与综合。
 
-1. **写时重排接入 codegen（MM 模板）**
-   - 现状：`systolic.reorder.*.dims/perm` 已在 DataflowGeneration 中写入；translate 在 **L2 intra/inter trans** 中已使用 `getArrayDims`、`applyAccessPermutation`。
-   - 缺口：**L3_in_serialize**（DRAM 读）、**drain_IO_L3_out_serialize**（DRAM 写）尚未按重排后的布局生成访问顺序。
-   - 动作：
-     - **L3_in_serialize**：当存在 reorder 属性时，按重排后的逻辑维度顺序生成读循环，使 DRAM 读顺序与重排布局一致（stride-1 或更连续）。
-     - **drain_IO_L3_out_serialize**：当存在 reorder 属性时，按重排后的维度顺序生成写循环，使写回为连续 burst（写时重排的核心）。
-   - 验收：对带 reorder 属性的 MM 生成 HLS，对比无 reorder 版本；写回循环应按 perm 后的维度顺序迭代。
+1. **写时重排接入 codegen（MM 模板）** ✅  
+   - **L2**：`getArrayDims`、`applyAccessPermutation` 已用于 L2 intra/inter trans。  
+   - **L3_in_serialize**：存在 2D 重排时已按重排维度顺序读。  
+   - **drain_IO_L3_out_serialize**：2D/3D 重排时已按重排顺序写回（buffer_linear 路径）。  
+   - 验收：`run_reorder_e2e.sh` / `run_reorder_3d_e2e.sh` 可生成并检查 `buffer_linear` 等模式。
 
 2. **小规模验证与回归**
    - 参数由**多面体分析给出的选择范围**确定（或当前阶段由用户在合法范围内手动指定）；不对所有输入使用单一全局预设。
@@ -70,14 +68,14 @@
 3. **文档与清单**
    - 在本文档中维护“小规模配置表”与“写时重排接入清单”；与 [SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md](SINGLE_MULTI_KERNEL_AND_HIGH_PERFORMANCE_STRATEGY.md) 对齐。
 
-### Phase 2：MTTKRP / TTMc 支持与写时重排
+### Phase 2：MTTKRP / TTMc 支持与写时重排（已部分完成）
 
 **目标**：4-loop MTTKRP（及同类 TTMc）能通过 mlir-systolic 生成 HLS，且写时重排/布局优化应用于读、写路径。
 
-1. **4-loop 支持**
-   - **SystolicTransform**：允许 band.size() ≥ 4（当前已有 ≥3；确认 4-loop 不早退）。
-   - **SystolicDataflowGeneration**：对 4 维数组与 4 维循环的引用分组、IO/PE/Drain 分类、reduction 维标注；写时重排分析支持 4 维（若当前仅 3 维则扩展）。
-   - **systolic-translate**：增加 **MTTKRP 模板分支**（或通用 4 数组/4-loop 分支）：识别 4-loop + 4 数组（如 A,B,C,D 或 D 为输出），生成 D 的 drain 与 A/B/C 的 IO；在 L3 serialize 与 drain serialize 中应用 reorder（与 Phase 1 逻辑一致）。
+1. **4-loop / 双规约 / 三规约支持** ✅  
+   - **systolic-translate**：已通过 ContractionDesc（Kind、num_time_loops）支持 MM、MTTKRP（r1）、TTMc（r1+r2）；数组名从参数推导，支持 3 输入 + 1 输出。  
+   - **rank-3 输出**：TTMc 的 3D drain 与 L3_serialize 三规约分支已实现。  
+   - **写时重排**：L2/L3/drain 的 2D/3D 重排已接入；MTTKRP/TTMc 的 _reorder 版本是否命中 buffer_linear 取决于 WriteTimeReorderingAnalyzer 是否对该 kernel 的 store 命中，可后续扩展分析器。
 
 2. **MTTKRP 小规模测例**
    - 提供小规模 MTTKRP 的 Affine MLIR（I,J,K,L=16 或 32）；在分析得到的参数选择范围内选取较小值生成 HLS，用于审查与综合。

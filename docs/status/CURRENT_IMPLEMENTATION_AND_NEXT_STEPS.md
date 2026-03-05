@@ -67,7 +67,7 @@
 | 单核：Affine → 依赖分析 → space-time → 分块 → IO/PE/FIFO → HLS | ✅ 主路径打通（属性驱动 + 固定模板） |
 | ST0–ST5 参数化 | ✅ 已支持 |
 | 与 AutoSA 行为对齐（单 kernel） | 🟡 主流程有，未做系统对比与回归测试 |
-| 通用 loop body migration | 🟡 未完成，偏 3-loop MM |
+| 多 kernel（MM/MTTKRP/TTMc）| ✅ translate 支持 3 输入 + 1 输出、双/三规约 r1/r2、2D/3D 输出 |
 | 写时重排/读时重排应用到生成 | ✅ 2D 已接入 L2、L3_in_serialize、drain_serialize（见 EXISTING_OPTIMIZATIONS_IN_CODE.md） |
 | SystolicDataflow 作为显式 IR 层 | 🟡 有 Dialect 与降级框架，主流程仍用属性 |
 | Host 端（Testbench/OpenCL） | ⚠️ 预留，未实现 |
@@ -76,70 +76,24 @@
 
 ---
 
-## 三、下一步应完成的工作（按设想优先级）
+## 三、下一步工作
 
-### 短期（1–2 周，与 NEXT_STEPS_ROADMAP / PROJECT_STATUS 一致）
-
-1. **测试与验证**
-   - 为 MM 跑齐 ST0–ST5 的用例（当前多为 ST3）。
-   - 用 `test/minimal_matmul.mlir` 或与 AutoSA 对齐的 C→MLIR 用例，做端到端测试并对比 AutoSA 输出结构。
-   - 可选：引入简单 lit 或脚本，自动化「opt → translate → 检查生成文件存在/关键符号」。
-
-2. **循环体迁移补齐**
-   - 实现**通用 loop body migration**，使非 3-loop MM（如 4 循环 MTTKRP、5 循环 CNN）也能正确迁移到 PE/IO 结构。
-   - 文档与代码中的 FIXME/TODO：SystolicDataflowToHLS 的「通用循环体迁移」、DataflowGeneration 的「迁移到 PE 的循环体」。
-
-3. **写时重排接到代码生成**
-   - 将 `systolic.reorder.*` 属性在 systolic-translate（或统一后的 EmitHLSCpp）中真正用于生成逻辑（访问顺序/缓冲布局），而不是只做分析。
-
-### 中期（1–2 月）
-
-4. **配置流重构（可选）**
-   - 定义 `SystolicConfigAttr`（或等价结构化属性），将 space_time、array_part、latency、pe_array_size 等从零散属性改为单一结构化配置，全流程传递。
-
-5. **Kernel 与测试扩展**
-   - MTTKRP、TTMc、CNN、LU 等：在通用 loop body migration 基础上，为每种 kernel 增加测试与（若可能）与 AutoSA 的结构对比。
-   - 文档中「待补充：ST0/1/2/4/5、CNN、MTTKRP、TTMc、TTM、LU」逐步勾选。
-
-6. **双缓冲与 HLS 质量**
-   - 在 SystolicDataflowToHLS 或生成侧完善双缓冲逻辑；减少生成冗余、统一代码风格，便于与 AutoSA 对比。
-
-### 远期（愿景文档）
-
-7. **共用脉动阵列与多算子映射**
-   - 多核描述（多 Affine 核/多 linalg op）→ 共用 SA 架构选择 → 每核在固定 SA 上的 tiling/调度生成。
-8. **Host 端**
-   - HLS Testbench、OpenCL Host 等。
-9. **自动调优**
-   - 单核与多核的搜索空间、代价模型或启发式，与脚本/框架集成。
+**当前优先级与具体条目**见根目录 [RECENT_CHANGES_AND_NEXT_STEPS.md](../../RECENT_CHANGES_AND_NEXT_STEPS.md) 与 [PHASE_CODEGEN_AND_HLS_TEST.md](PHASE_CODEGEN_AND_HLS_TEST.md)（本阶段清单与后续改进）。主要包括：服务器 C sim/综合验证、写时重排分析扩展、FIFO 深度推导、更多 kernel 等。
 
 ---
 
-## 四、建议的立即行动
+## 四、验证与脚本
 
-1. **运行并固化一条端到端命令**（便于后续回归）✅  
-   已提供 **`test/run_mm_e2e.sh`**：运行 opt → translate，并检查生成 cpp 含 kernel0、PIPELINE、DATAFLOW、PE_wrapper 等，输出 PASS/FAIL。示例：
-   ```bash
-   ./test/run_mm_e2e.sh
-   # 或指定输入/输出: ./test/run_mm_e2e.sh test/minimal_matmul.mlir /tmp/out.mlir /tmp/out.cpp
-   ```
-
-2. **补充/整理测试**  
-   将 `test/minimal_matmul.mlir` 纳入正式测试目录（如 `test/matmul/`），并增加 README 或 TESTING_GUIDE 中对该流程的说明。
-
-3. **写时/读时重排应用到生成** ✅  
-   2D 已接入：L2（getArrayDims/applyAccessPermutation）、L3_in_serialize、drain_serialize。见 [EXISTING_OPTIMIZATIONS_IN_CODE.md](../design/EXISTING_OPTIMIZATIONS_IN_CODE.md)。
-
-4. **通用 loop body migration**  
-   这是支持 MTTKRP、CNN 等更多 kernel 的前提。当前 4-loop MTTKRP 已可 opt→translate 生成 HLS（数组名从参数推导，见 `test/minimal_mttkrp.mlir`、`test/run_mttkrp_e2e.sh`）。
+- **全量 e2e**：`./test/run_all_e2e.sh`（MM、MTTKRP、TTMc、写时重排 2D/3D，共 5 项）
+- **单测**：`./test/run_mm_e2e.sh`、`./test/run_mttkrp_e2e.sh`、`./test/run_ttmc_std_e2e.sh`、`./test/run_reorder_e2e.sh`、`./test/run_reorder_3d_e2e.sh`
+- **生成供服务器 HLS**：`./test/generate_hls_for_server.sh` → `build/hls_for_server/`
+- **写时/读时重排**：已接入 L2、L3_in_serialize、drain_serialize，见 [EXISTING_OPTIMIZATIONS_IN_CODE.md](../design/EXISTING_OPTIMIZATIONS_IN_CODE.md)
 
 ---
 
 ## 五、参考文档
 
-- **脉动阵列优化改进计划**：`docs/design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md`（MTTKRP/TTMc 写时重排、MM/CNN 小规模、分阶段实现与任务清单）
-- 愿景与阶段：`docs/VISION_AND_DESIGN_GOALS.md`
-- 状态概览：`docs/status/PROJECT_STATUS.md`
-- 下一步路线：`docs/status/NEXT_STEPS_ROADMAP.md`
-- 代码结构与 FIXME：`docs/guide/CODE_STRUCTURE.md`
-- 架构与目标：`docs/ARCHITECTURE_OVERVIEW.md`
+- 状态与阶段： [PROJECT_STATUS.md](PROJECT_STATUS.md)、[PHASE_CODEGEN_AND_HLS_TEST.md](PHASE_CODEGEN_AND_HLS_TEST.md)
+- 设计： [SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md](../design/SYSTOLIC_OPTIMIZATION_IMPROVEMENT_PLAN.md)、[EXISTING_OPTIMIZATIONS_IN_CODE.md](../design/EXISTING_OPTIMIZATIONS_IN_CODE.md)、[HLS_SEMANTIC_AUDIT.md](../design/HLS_SEMANTIC_AUDIT.md)
+- 愿景与架构： [VISION_AND_DESIGN_GOALS.md](../VISION_AND_DESIGN_GOALS.md)、[ARCHITECTURE_OVERVIEW.md](../ARCHITECTURE_OVERVIEW.md)、[guide/CODE_STRUCTURE.md](../guide/CODE_STRUCTURE.md)
+- 全量索引： [DOCS_INDEX.md](../DOCS_INDEX.md)

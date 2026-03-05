@@ -1,6 +1,6 @@
 # 代码生成现状与下一步分析
 
-> 基于最新一次提交（45a6dab，2026-03-04）的结论，明确当前代码生成流程的现状与准备修改的方向。
+> **说明**：本文档基于 2026-03 早期提交（45a6dab）的分析，部分问题已在后续完成：ContractionDesc、r1/r2 双/三规约、rank-3 输出（TTMc）、L2/c2 语义修复等。当前实现状态以 [RECENT_CHANGES_AND_NEXT_STEPS.md](../../RECENT_CHANGES_AND_NEXT_STEPS.md)、[CODEGEN_REFACTOR_ASSESSMENT.md](CODEGEN_REFACTOR_ASSESSMENT.md) 为准。
 
 ---
 

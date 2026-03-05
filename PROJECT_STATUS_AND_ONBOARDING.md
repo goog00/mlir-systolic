@@ -11,7 +11,7 @@
 - **核心依赖**：**Polymer**（多面体分析，ISL） + **MLIR**（变换与代码生成）。LLVM/MLIR 来自 **Polygeist 子项目** 的构建，**不使用系统自带的 LLVM**。
 - **当前能力**：
   - **Pass 链**：`systolic-write-reorder-analysis`（可选）→ `systolic-transform` → `systolic-dataflow-generation` → 生成 SystolicDataflow IR；再由 **systolic-translate** 生成 HLS C++。
-  - **支持的 kernel**：MM（矩阵乘）、MTTKRP（4 循环）、写时重排 2D/3D 测例；模板支持最多 3 输入 + 1 输出。
+  - **支持的 kernel**：MM（矩阵乘）、MTTKRP（4 循环）、TTMc（3D 输出、三规约 r2）、写时重排 2D/3D 测例；模板支持最多 3 输入 + 1 输出。
   - **已做优化**：写时重排（2D/3D）、读时重排（2D）、L3 coalesced 读（tile 顺序 + word_idx）、FIFO 深度可配置、RESOURCE 系统化（FIFO_SRL/RAM_2P_BRAM）、Pipeline 内 %/ 强度削减（2 的幂时用位运算）、L2 声明/定义维度一致；**DRAM/打包常量**与**循环变量位宽按 bound 动态计算**；**L2 与 c2 语义修复**（每 c2 先 inter_trans 再 intra_trans，L3 按 c2 重复输出，见 [HLS_SEMANTIC_AUDIT](docs/design/HLS_SEMANTIC_AUDIT.md)）。
 - **设计原则**：后续改进可**参考 AutoSA 的流程与结构**（其在 PPCG 上已验证），同时**保留 MLIR 优势与既有改进**；见 [docs/design/CODEGEN_REFACTOR_ASSESSMENT.md](docs/design/CODEGEN_REFACTOR_ASSESSMENT.md) 第 0 节。
 

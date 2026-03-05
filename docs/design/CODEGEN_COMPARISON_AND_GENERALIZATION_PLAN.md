@@ -1,7 +1,7 @@
 # 代码生成逻辑对比与通用化方案（面向 MTTKRP / TTMc）
 
-> 日期：2026-03-04
-> 目标：解释当前 mlir-systolic 代码生成为何在 `mttkrp/ttmc` 上出现语义问题，并给出可落地、可扩展的通用化重构路径。
+> 日期：2026-03-04（历史设计文档）  
+> **说明**：文中描述的「rank-3 被拦截」「双规约仅一层 c5」等问题已在后续通过 ContractionDesc、r1/r2、rank-3 支持与 L2/c2 语义修复解决。当前实现见 [CODEGEN_REFACTOR_ASSESSMENT.md](CODEGEN_REFACTOR_ASSESSMENT.md)、[RECENT_CHANGES_AND_NEXT_STEPS.md](../../RECENT_CHANGES_AND_NEXT_STEPS.md)。
 
 ---
 
@@ -40,7 +40,7 @@
 ### 1.3 结果层面的表现
 
 - `mttkrp`（标准语义）可生成 HLS C，但 `csim` 不通过（当前已复现）。
-- `ttmc`（rank-3 输出）当前被保护性拦截（`unsupported output rank 3`），避免继续生成错误代码。
+- `ttmc`（rank-3 输出）此前被保护性拦截；**现已支持**（TtmcLike、r2 循环、3D drain）。
 
 ---
 

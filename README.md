@@ -19,7 +19,7 @@
 - **[docs/guide/DEVELOPMENT_GUIDE.md](docs/guide/DEVELOPMENT_GUIDE.md)** — 开发指南
 - **[docs/reference/PROJECT_STRUCTURE.md](docs/reference/PROJECT_STRUCTURE.md)** — 项目目录结构
 - **[docs/status/PROJECT_STATUS.md](docs/status/PROJECT_STATUS.md)** — 当前状态与进展
-- **[docs/status/NEXT_STEPS_ROADMAP.md](docs/status/NEXT_STEPS_ROADMAP.md)** — 下一步工作路线
+- **[docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)** — 全量文档索引
 - **[scripts/README.md](scripts/README.md)** — Scripts 使用指南
 
 ---
@@ -41,7 +41,7 @@
 - AutoSA 基于多面体模型，使用 ISL Schedule Tree 进行依赖分析和循环变换
 - **没有调度树，就无法正确分解 task 成多个独立的 module 函数**
 - 这是 ScaleHLS 无法解决的问题，也是我们创建 mlir-systolic 的主要原因
-- 详见：[Polymer 集成方案](docs/POLYMER_INTEGRATION.md)
+- 详见：`docs/features/polymer/`（如 POLYMER_INTEGRATION_COMPLETE.md）与 [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
 
 ## 架构
 
@@ -324,7 +324,7 @@ ls third_party/Polygeist/build/lib/libPolymer*.a
 ninja -j1  # 单线程，最安全
 ```
 
-更多信息请参考 `docs/BUILD_STEPS.md`。
+更多信息请参考 [docs/BUILD_AND_SERVER_ENVIRONMENT.md](docs/BUILD_AND_SERVER_ENVIRONMENT.md) 与 [docs/guide/BUILD_GUIDE.md](docs/guide/BUILD_GUIDE.md)。
 
 ## 使用示例
 
@@ -339,7 +339,7 @@ systolic-opt matmul.mlir \
   -o matmul_systolic.mlir
 
 # 3. 生成 HLS C++
-systolic-translate matmul_systolic.mlir -emit-hlscpp > matmul_hls.cpp
+systolic-translate matmul_systolic.mlir -o matmul_hls.cpp
 ```
 
 ## 与 AutoSA 的对比
@@ -381,9 +381,9 @@ mlir-systolic/
 ├── tools/systolic-opt/             # 主工具
 ├── test/
 │   ├── matmul/                     # 矩阵乘测试用例
-│   └── reference-samples/          # AutoSA 生成的参考 HLS C++ 文件
+│   └── autosa_hls_refs/            # AutoSA 生成的参考 HLS C++（可选）
 └── docs/
-    └── TECHNICAL_REDESIGN.md ⭐     # 技术方案详细文档
+    └── DOCS_INDEX.md               # 全量文档索引；设计文档见 docs/design/
 ```
 
 ## 开发路线
@@ -412,35 +412,22 @@ mlir-systolic/
 - [x] EmitHLSCpp.cpp - 代码生成 ✅
 
 ### Phase 4: 验证
-- [ ] MatMul 端到端测试
-- [ ] 与 AutoSA 输出对比（Kernel 部分）
+- [x] MM/MTTKRP/TTMc 端到端测试（`./test/run_all_e2e.sh`）
+- [ ] 服务器 C sim / 综合验证；与 AutoSA 输出对比（Kernel 部分）
 
 ### Phase 5: Host 端代码生成（预留，暂不实现）
 - [ ] HLS Testbench 生成接口
 - [ ] OpenCL Host 代码生成接口
 - [ ] 其他目标平台支持接口
 
-**最新进展**：详见 [项目进展总结](docs/PROJECT_STATUS.md)
+**最新进展**：详见 [项目进展总结](docs/status/PROJECT_STATUS.md) 与 [RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md)
 
 ## 文档
 
-详细的技术方案和设计思路请参考：
-
-### 核心文档
-- **[项目进展总结](docs/PROJECT_STATUS.md)** ⭐ **最新** - 当前项目状态和最新更新
-- **[构建指南](docs/BUILD_STEPS.md)** ⭐ **推荐** - 详细的构建步骤和故障排除
-- **[快速参考](docs/QUICK_REFERENCE.md)** ⭐ **推荐** - 常用命令和参数配置快速查找
-- **[架构设计](docs/ARCHITECTURE.md)** - 项目架构和设计理念
-- **[开发指南](docs/DEVELOPMENT_GUIDE.md)** - 开发流程和代码结构
-
-### AutoSA 相关
-- **[AutoSA 详细分析](docs/AUTOSA_ANALYSIS.md)** ⭐ **核心** - AutoSA 架构、算法、参数影响、代码生成流程
-- **[AutoSA Spacetime 分析](docs/AUTOSA_SPACETIME_ANALYSIS.md)** - Spacetime 参数详细分析（0-5）
-- **[AutoSA 测试生成指南](docs/AUTOSA_TEST_GENERATION_GUIDE.md)** - 生成不同 Spacetime 和参数的测试用例
-- **[随机读取问题分析](docs/RANDOM_ACCESS_ISSUE_ANALYSIS.md)** - MTTKRP 等 Kernel 的随机读取问题分析和修复方法
-
-### 完整文档索引
-请查看 [docs/README.md](docs/README.md) 获取完整的文档列表和分类。
+- **状态与下一步**：[PROJECT_STATUS_AND_ONBOARDING.md](PROJECT_STATUS_AND_ONBOARDING.md)、[RECENT_CHANGES_AND_NEXT_STEPS.md](RECENT_CHANGES_AND_NEXT_STEPS.md)
+- **架构与开发**：[docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md)、[docs/guide/BUILD_GUIDE.md](docs/guide/BUILD_GUIDE.md)、[docs/guide/DEVELOPMENT_GUIDE.md](docs/guide/DEVELOPMENT_GUIDE.md)
+- **AutoSA 参考**：[docs/reference/autosa/](docs/reference/autosa/)（含 AUTOSA_SOURCE_PERF_AND_MLIR_OPPORTUNITIES、对照分析等）
+- **全量索引**：[docs/DOCS_INDEX.md](docs/DOCS_INDEX.md) — 所有 Markdown 文档列表与说明
 
 **核心改进**：
 1. 引入 `SystolicDataflow` Dialect 作为中间抽象层
