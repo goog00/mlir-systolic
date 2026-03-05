@@ -1,6 +1,7 @@
 # mlir-systolic 文档全量索引
 
 > 本文件列出**项目内所有 Markdown 文档**（不含 third_party），便于查找与整理。  
+> **Agent 入口**：根目录 [PROJECT_STATUS_AND_ONBOARDING.md](../PROJECT_STATUS_AND_ONBOARDING.md)、[RECENT_CHANGES_AND_NEXT_STEPS.md](../RECENT_CHANGES_AND_NEXT_STEPS.md)。  
 > 最后更新：2026-03
 
 ---
@@ -11,7 +12,7 @@
 |------|------|
 | [../README.md](../README.md) | 项目概述、构建、目录结构、与 AutoSA 对比 |
 | [../PROJECT_STATUS_AND_ONBOARDING.md](../PROJECT_STATUS_AND_ONBOARDING.md) | **新环境/新 Agent 上手指南**：做了啥、如何验证、下一步、服务器环境 |
-| [../RECENT_CHANGES_AND_NEXT_STEPS.md](../RECENT_CHANGES_AND_NEXT_STEPS.md) | 近期修改与下一步、文档索引、写时重排与 e2e 说明 |
+| [../RECENT_CHANGES_AND_NEXT_STEPS.md](../RECENT_CHANGES_AND_NEXT_STEPS.md) | **Agent 首选**：近期修改、L2/c2 语义修复、验证命令与下一步 |
 
 ---
 
@@ -42,6 +43,8 @@
 | [CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md) | AutoSA 对比与通用化重构路线（支持 mttkrp/ttmc） |
 | [AUTOSA_MTTKRP_FLOW_AND_MLIR_CODEGEN.md](design/AUTOSA_MTTKRP_FLOW_AND_MLIR_CODEGEN.md) | AutoSA 处理 MTTKRP 的路线与 MLIR 代码生成器适配 |
 | [CODEGEN_STATUS_AND_NEXT_ANALYSIS.md](design/CODEGEN_STATUS_AND_NEXT_ANALYSIS.md) | 代码生成现状与下一步分析（规约/循环骨架） |
+| [AUTOSA_VS_MLIR_SYSTOLIC_MTTKRP_L2_ACCESS.md](design/AUTOSA_VS_MLIR_SYSTOLIC_MTTKRP_L2_ACCESS.md) | AutoSA 与 mlir-systolic MTTKRP HLS：L2 阶段随机读取对比 |
+| [HLS_SEMANTIC_AUDIT.md](design/HLS_SEMANTIC_AUDIT.md) | 生成 HLS C 的语义正确性检查（L2 与 c2、PE/drain 等） |
 
 ---
 
@@ -51,6 +54,7 @@
 |------|------|
 | [PROJECT_STATUS.md](status/PROJECT_STATUS.md) | 项目状态概览（亮点、组件、已知问题、测试现状） |
 | [CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md](status/CURRENT_IMPLEMENTATION_AND_NEXT_STEPS.md) | 当前实现与下一步（构建、Pass、HLS 生成、e2e、建议行动） |
+| [PHASE_CODEGEN_AND_HLS_TEST.md](status/PHASE_CODEGEN_AND_HLS_TEST.md) | **本阶段**：代码生成器重构与服务器 HLS 测试（清单、生成脚本、后续改进） |
 
 ---
 

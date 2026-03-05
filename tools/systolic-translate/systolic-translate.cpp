@@ -119,20 +119,35 @@ struct ContractionDesc {
   enum class Kind {
     MatmulLike,   // rank-2, 1 reduction (MM)
     MttkrpLike,   // rank-2, 2 reductions (MTTKRP)
-    TtmcLike,     // rank-3 output (TTMc 等)，当前仅支持 numReductions<=2 时生成 3D drain
-    Unsupported,  // rank>3 或 rank-3 且 numReductions>2
+    TtmcLike,     // rank-3 output (TTMc 等)，支持 numReductions<=3 时生成 3D drain
+    Unsupported,  // rank>3 或 rank-3 且 numReductions>3
   };
   Kind kind = Kind::MatmulLike;
 
   /// 是否需要在 PE/IO 中插入“第二规约维”循环（r1, 0..size-1）。
   bool hasExtraReductionLoop() const { return numReductions >= 2; }
+  /// 是否需要在 PE/IO 中插入“第三规约维”循环（r2, 0..size-1），用于 TTMc 等 3 规约维。
+  bool hasThirdReductionLoop() const { return numReductions >= 3; }
   /// 是否生成 3D 输出的 drain 写回路径。
   bool isRank3Output() const { return outputRank == 3; }
 };
 
+// DRAM word / pack 常量（与 AutoSA 等 512-bit 总线约定一致，便于扩展与对照）
+static const unsigned kDramWordBytes = 64;   // 512 bits
+static const unsigned kFloatsPerDramWord = 16;
+static const unsigned kDramWordBits = 512;
+
 // Helpers for pipeline-friendly strength reduction: use bitwise when divisor is power-of-2
 static bool isPowerOf2(unsigned n) { return n && !(n & (n - 1)); }
 static unsigned log2Po2(unsigned n) { return (unsigned)llvm::Log2_32(n); }
+/// 循环变量所需位宽（bound 为 inclusive 上界），避免大 size 溢出，参考 AutoSA 风格按界计算
+static unsigned requiredLoopBits(uint64_t bound) {
+  if (bound == 0) return 1;
+  uint64_t v = bound + 1;
+  unsigned bits = 0;
+  while (v) { bits++; v >>= 1; }
+  return std::min(32u, std::max(1u, bits));
+}
 
 class SystolicHLSEmitter {
 public:
@@ -158,6 +173,13 @@ private:
   unsigned tileSize;  // = latency * numPE
   unsigned numTiles;  // = size / tileSize
   unsigned indentLevel = 0;
+
+  /// 循环变量位宽（按 bound 计算，避免大 size 溢出，参考 AutoSA 等按界生成）
+  unsigned bitsTiles = 3;   // c0,c1,c2: bound numTiles-1
+  unsigned bitsPE = 2;      // c3,c4: bound numPE-1
+  unsigned bitsSize = 4;    // r1,r2: bound size-1
+  unsigned bitsLatency = 3; // c6,c7: bound latency-1
+  unsigned bitsC5Bound = 3; // c5: bound c5Bound-1
 
   // 由上游 Pass 传入的 contraction 级别信息（目前仅使用 numReductions/outputRank）
   ContractionDesc contraction;
@@ -280,11 +302,11 @@ void SystolicHLSEmitter::emitTypeDefinitions() {
   os << "/* Data Type */\n";
   for (const auto &n : inputNames) {
     os << "typedef float " << n << "_t1;\n";
-    os << "typedef ap_uint<512> " << n << "_t16;\n";
+    os << "typedef ap_uint<" << kDramWordBits << "> " << n << "_t16;\n";
     os << "typedef ap_uint<" << (arrayPart * 32) << "> " << n << "_t" << arrayPart << ";\n";
   }
   os << "typedef float " << outputName << "_t1;\n";
-  os << "typedef ap_uint<512> " << outputName << "_t16;\n";
+  os << "typedef ap_uint<" << kDramWordBits << "> " << outputName << "_t16;\n";
   os << "typedef ap_uint<" << (latency * 32) << "> " << outputName << "_t" << latency << ";\n";
   os << "/* Data Type */\n\n";
 }
@@ -347,8 +369,10 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
 
   if (hasReordering2D(arrayName)) {
     // Read-time reordering: iterate (d0,d1) in reordered layout order; DRAM read is still
-    // sequential (word_idx = reordered_linear/16). Assumes input is in reordered layout.
+    // sequential (word_idx = reordered_linear / kFloatsPerDramWord). Assumes input is in reordered layout.
     unsigned loopBits = (unsigned)ceil(log2(totalSize + 1));
+    unsigned wordShift = log2Po2(kFloatsPerDramWord);
+    unsigned wordMask = kFloatsPerDramWord - 1;
     os << "  /* Read in reordered dimension order (input assumed reordered layout) */\n";
     os << "  " << arrayName << "_t16 current_word;\n";
     os << "  union { float f; uint32_t u; } tmp;\n";
@@ -359,8 +383,8 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
     os << "  for (ap_uint<" << loopBits << "> d0 = 0; d0 < " << totalSize << "; d0++)\n";
     os << "    for (ap_uint<" << loopBits << "> d1 = 0; d1 < " << totalSize << "; d1++) {\n";
     os << "      reordered_linear = d0 * " << totalSize << " + d1;\n";
-    os << "      word_idx = reordered_linear >> 4;\n";
-    os << "      offset = reordered_linear & 15;\n";
+    os << "      word_idx = reordered_linear >> " << wordShift << ";\n";
+    os << "      offset = reordered_linear & " << wordMask << ";\n";
     os << "      if (offset == 0) current_word = " << arrayName << "[word_idx];\n";
     os << "      tmp.u = current_word.range(32*(int)(offset+1)-1, 32*(int)offset).to_uint();\n";
     os << "      buf[count++] = tmp.f;\n";
@@ -376,38 +400,52 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
     os << "    }\n";
   } else {
     // Coalesced L3 read: same (c0,c1,c3) tile order as L3_in, explicit word_idx for sequential DRAM burst
-    unsigned wordsPerDram = 16 / arrayPart;  // 512-bit word = 16 floats; each FIFO word = arrayPart floats
+    unsigned wordsPerDram = kFloatsPerDramWord / arrayPart;
     bool doubleReduction = contraction.hasExtraReductionLoop();
-    bool use3DSlice = doubleReduction && arrayShape.size() == 3;
+    bool thirdReduction = contraction.hasThirdReductionLoop();
+    bool use3DSlice = (doubleReduction || thirdReduction) && arrayShape.size() == 3;
     unsigned totalDramWords;
     unsigned wordsPerPlane = 0;
     if (use3DSlice) {
-      // 3D input (e.g. A[I,K,L] in MTTKRP): r1 indexes the third dim; read plane r1 per (c0,c1,c3,c4g)
-      wordsPerPlane = (unsigned)((arrayShape[0] * arrayShape[1] * 4) / 64);
+      wordsPerPlane = (unsigned)((arrayShape[0] * arrayShape[1] * 4) / kDramWordBytes);
       if (wordsPerPlane == 0) wordsPerPlane = 1;
-      totalDramWords = wordsPerPlane;
+      // 3D array total words = wordsPerPlane * dim2; for triple reduction we repeat read (r2,r1) so same total
+      totalDramWords = wordsPerPlane * (thirdReduction ? (unsigned)arrayShape[2] : size);
+      if (totalDramWords == 0) totalDramWords = wordsPerPlane * size;
     } else {
-      totalDramWords = (totalSize * totalSize * 4) / 64;
+      totalDramWords = (totalSize * totalSize * 4) / kDramWordBytes;
     }
     unsigned c4GroupBound = totalDramWords / (numTiles * numTiles * numPE);
     if (c4GroupBound == 0) c4GroupBound = 1;
     unsigned strideC0 = numTiles * numPE * c4GroupBound;
     unsigned strideC1 = numPE * c4GroupBound;
+    bool triple3D = thirdReduction && use3DSlice;  // repeat same 3D data for each (r2,r1)
+    bool matmulLike = !doubleReduction && !triple3D && !use3DSlice;  // MM: repeat same DRAM data per c2 (reduction tile)
     os << "  /* Coalesced L3 read: tile order (c0,c1,c3,c4_group), word_idx sequential for burst";
     if (use3DSlice)
-      os << "; 3D array, r1 = plane index";
+      os << "; 3D array, r1" << (triple3D ? ",r2 repeat" : " = plane index");
+    if (matmulLike)
+      os << "; MatmulLike: repeat per c2 (reduction tile)";
     os << " */\n";
     os << "  " << arrayName << "_t" << arrayPart << " fifo_data;\n";
     os << "  " << arrayName << "_t16 mem_data;\n";
     os << "  unsigned word_idx;\n";
-    os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-    os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
+    if (matmulLike) {
+      // L2 loads once per (c0,c1,c2): output same 128 words numTiles times so each c2 gets a full batch
+      os << "  for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1)\n";
+    }
+    os << "  for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+    os << "    for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
+    if (triple3D)
+      os << "      for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
     if (doubleReduction)
-      os << "      for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
-    os << "      for (ap_uint<2> c3 = 0; c3 <= " << (numPE - 1) << "; c3 += 1)\n";
+      os << "      for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "      for (ap_uint<" << bitsPE << "> c3 = 0; c3 <= " << (numPE - 1) << "; c3 += 1)\n";
     os << "        for (ap_uint<" << (unsigned)ceil(log2(c4GroupBound + 1)) << "> c4g = 0; c4g <= " << (c4GroupBound - 1) << "; c4g += 1) {\n";
-    if (use3DSlice)
+    if (use3DSlice && !triple3D)
       os << "          word_idx = r1 * " << wordsPerPlane << "U + c0 * " << strideC0 << "U + c1 * " << strideC1 << "U + c3 * " << c4GroupBound << "U + c4g;\n";
+    else if (triple3D)
+      os << "          word_idx = c0 * " << strideC0 << "U + c1 * " << strideC1 << "U + c3 * " << c4GroupBound << "U + c4g;\n";
     else
       os << "          word_idx = c0 * " << strideC0 << "U + c1 * " << strideC1 << "U + c3 * " << c4GroupBound << "U + c4g;\n";
     os << "          mem_data = " << arrayName << "[word_idx];\n";
@@ -420,6 +458,8 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
     os << "        }\n";
     if (doubleReduction)
       os << "      }\n";
+    if (triple3D)
+      os << "      }\n";
   }
   os << "}\n";
   os << "/* Module Definition */\n\n";
@@ -427,21 +467,26 @@ void SystolicHLSEmitter::emitIOL3InSerialize(StringRef arrayName,
 
 void SystolicHLSEmitter::emitIOL3In(StringRef arrayName, StringRef typeName) {
   bool doubleReduction = contraction.hasExtraReductionLoop();
+  bool thirdReduction = contraction.hasThirdReductionLoop();
+  bool matmulLike = !doubleReduction && !thirdReduction;
   os << "/* Module Definition */\n";
   os << "void " << arrayName << "_IO_L3_in(hls::stream<" << arrayName << "_t" 
      << arrayPart << "> &fifo_" << arrayName << "_in, hls::stream<" 
      << arrayName << "_t" << arrayPart << "> &fifo_" << arrayName 
      << "_local_out) {\n";
   os << "#pragma HLS INLINE OFF\n";
-  // c0, c1, c2 iterate over tiles: numTiles = size / (latency * numPE)
-  os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-  os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
+  os << "  for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+  os << "    for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
+  if (matmulLike)
+    os << "      for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  if (thirdReduction)
+    os << "      for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (doubleReduction)
-    os << "      for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "      for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
   os << "      // io_L3\n";
-  os << "      for (ap_uint<2> c3 = 0; c3 <= " << (numPE - 1) << "; c3 += 1) {\n";
+  os << "      for (ap_uint<" << bitsPE << "> c3 = 0; c3 <= " << (numPE - 1) << "; c3 += 1) {\n";
   os << "        // io_L2\n";
-  os << "        for (ap_uint<3> c4 = 0; c4 <= " << (latency - 1) << "; c4 += 1) {\n";
+  os << "        for (ap_uint<" << bitsLatency << "> c4 = 0; c4 <= " << (latency - 1) << "; c4 += 1) {\n";
   os << "        #pragma HLS PIPELINE II=1\n";
   os << "          // access_coalesce\n";
   os << "          // access_serialize\n";
@@ -455,6 +500,10 @@ void SystolicHLSEmitter::emitIOL3In(StringRef arrayName, StringRef typeName) {
   os << "        }\n";
   os << "      }\n";
   if (doubleReduction)
+    os << "      }\n";
+  if (thirdReduction)
+    os << "      }\n";
+  if (matmulLike)
     os << "      }\n";
   os << "    }\n";
   os << "}\n";
@@ -631,25 +680,28 @@ void SystolicHLSEmitter::emitIOL2In(StringRef arrayName) {
   os << "  bool intra_trans_en = 1;\n";
   os << "  /* Variable Declaration */\n\n";
   bool doubleReduction = contraction.hasExtraReductionLoop();
+  bool thirdReduction = contraction.hasThirdReductionLoop();
   os << "  {\n";
-  os << "    for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-  os << "      for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
+  os << "    for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+  os << "      for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
   os << "        // array\n";
   os << "        // io_L3\n";
   os << "        if (arb == 0) {\n";
-  os << "          " << arrayName << "_IO_L2_in_inter_trans(\n";
-  os << "            /* module id */ idx, \n";
-  os << "            /* host iter */ c0, \n";
-  os << "            /* host iter */ c1, \n";
-  os << "            /* host iter */ 0, \n";
-  os << "            /* array */ local_" << arrayName << "_pong, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_in, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_out, \n";
-  os << "            /* enable */ inter_trans_en\n";
-  os << "          );\n";
-  os << "          for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "          for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "            " << arrayName << "_IO_L2_in_inter_trans(\n";
+  os << "              /* module id */ idx, \n";
+  os << "              /* host iter */ c0, \n";
+  os << "              /* host iter */ c1, \n";
+  os << "              /* host iter */ c2, \n";
+  os << "              /* array */ local_" << arrayName << "_pong, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_in, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_out, \n";
+  os << "              /* enable */ inter_trans_en\n";
+  os << "            );\n";
+  if (thirdReduction)
+    os << "            for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (doubleReduction)
-    os << "            for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "            for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
   os << "            " << arrayName << "_IO_L2_in_intra_trans(\n";
   os << "              /* module id */ idx, \n";
   os << "              /* host iter */ c0, \n";
@@ -661,21 +713,25 @@ void SystolicHLSEmitter::emitIOL2In(StringRef arrayName) {
   os << "            );\n";
   if (doubleReduction)
     os << "            }\n";
+  if (thirdReduction)
+    os << "            }\n";
   os << "          }\n";
   os << "        } else {\n";
-  os << "          " << arrayName << "_IO_L2_in_inter_trans(\n";
-  os << "            /* module id */ idx, \n";
-  os << "            /* host iter */ c0, \n";
-  os << "            /* host iter */ c1, \n";
-  os << "            /* host iter */ 0, \n";
-  os << "            /* array */ local_" << arrayName << "_ping, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_in, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_out, \n";
-  os << "            /* enable */ inter_trans_en\n";
-  os << "          );\n";
-  os << "          for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "          for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "            " << arrayName << "_IO_L2_in_inter_trans(\n";
+  os << "              /* module id */ idx, \n";
+  os << "              /* host iter */ c0, \n";
+  os << "              /* host iter */ c1, \n";
+  os << "              /* host iter */ c2, \n";
+  os << "              /* array */ local_" << arrayName << "_ping, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_in, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_out, \n";
+  os << "              /* enable */ inter_trans_en\n";
+  os << "            );\n";
+  if (thirdReduction)
+    os << "            for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (doubleReduction)
-    os << "            for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "            for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
   os << "            " << arrayName << "_IO_L2_in_intra_trans(\n";
   os << "              /* module id */ idx, \n";
   os << "              /* host iter */ c0, \n";
@@ -686,6 +742,8 @@ void SystolicHLSEmitter::emitIOL2In(StringRef arrayName) {
   os << "              /* enable */ intra_trans_en\n";
   os << "            );\n";
   if (doubleReduction)
+    os << "            }\n";
+  if (thirdReduction)
     os << "            }\n";
   os << "          }\n";
   os << "        }\n";
@@ -716,24 +774,27 @@ void SystolicHLSEmitter::emitIOL2InBoundary(StringRef arrayName) {
   os << "  bool intra_trans_en = 1;\n";
   os << "  /* Variable Declaration */\n\n";
   bool doubleReduction = contraction.hasExtraReductionLoop();
+  bool thirdReduction = contraction.hasThirdReductionLoop();
   os << "  {\n";
-  os << "    for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-  os << "      for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
+  os << "    for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+  os << "      for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1) {\n";
   os << "        // array\n";
   os << "        // io_L3\n";
   os << "        if (arb == 0) {\n";
-  os << "          " << arrayName << "_IO_L2_in_inter_trans_boundary(\n";
-  os << "            /* module id */ idx, \n";
-  os << "            /* host iter */ c0, \n";
-  os << "            /* host iter */ c1, \n";
-  os << "            /* host iter */ 0, \n";
-  os << "            /* array */ local_" << arrayName << "_pong, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_in, \n";
-  os << "            /* enable */ inter_trans_en\n";
-  os << "          );\n";
-  os << "          for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "          for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "            " << arrayName << "_IO_L2_in_inter_trans_boundary(\n";
+  os << "              /* module id */ idx, \n";
+  os << "              /* host iter */ c0, \n";
+  os << "              /* host iter */ c1, \n";
+  os << "              /* host iter */ c2, \n";
+  os << "              /* array */ local_" << arrayName << "_pong, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_in, \n";
+  os << "              /* enable */ inter_trans_en\n";
+  os << "            );\n";
+  if (thirdReduction)
+    os << "            for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (doubleReduction)
-    os << "            for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "            for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
   os << "            " << arrayName << "_IO_L2_in_intra_trans(\n";
   os << "              /* module id */ idx, \n";
   os << "              /* host iter */ c0, \n";
@@ -745,20 +806,24 @@ void SystolicHLSEmitter::emitIOL2InBoundary(StringRef arrayName) {
   os << "            );\n";
   if (doubleReduction)
     os << "            }\n";
+  if (thirdReduction)
+    os << "            }\n";
   os << "          }\n";
   os << "        } else {\n";
-  os << "          " << arrayName << "_IO_L2_in_inter_trans_boundary(\n";
-  os << "            /* module id */ idx, \n";
-  os << "            /* host iter */ c0, \n";
-  os << "            /* host iter */ c1, \n";
-  os << "            /* host iter */ 0, \n";
-  os << "            /* array */ local_" << arrayName << "_ping, \n";
-  os << "            /* fifo */ fifo_" << arrayName << "_in, \n";
-  os << "            /* enable */ inter_trans_en\n";
-  os << "          );\n";
-  os << "          for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "          for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "            " << arrayName << "_IO_L2_in_inter_trans_boundary(\n";
+  os << "              /* module id */ idx, \n";
+  os << "              /* host iter */ c0, \n";
+  os << "              /* host iter */ c1, \n";
+  os << "              /* host iter */ c2, \n";
+  os << "              /* array */ local_" << arrayName << "_ping, \n";
+  os << "              /* fifo */ fifo_" << arrayName << "_in, \n";
+  os << "              /* enable */ inter_trans_en\n";
+  os << "            );\n";
+  if (thirdReduction)
+    os << "            for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (doubleReduction)
-    os << "            for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "            for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
   os << "            " << arrayName << "_IO_L2_in_intra_trans(\n";
   os << "              /* module id */ idx, \n";
   os << "              /* host iter */ c0, \n";
@@ -770,6 +835,8 @@ void SystolicHLSEmitter::emitIOL2InBoundary(StringRef arrayName) {
   os << "            );\n";
   if (doubleReduction)
     os << "            }\n";
+  if (thirdReduction)
+    os << "            }\n";
   os << "          }\n";
   os << "        }\n";
   os << "        arb = !arb;\n";
@@ -780,14 +847,18 @@ void SystolicHLSEmitter::emitIOL2InBoundary(StringRef arrayName) {
 }
 
 void SystolicHLSEmitter::emitPEInitCondition() {
-  if (contraction.hasExtraReductionLoop())
+  if (contraction.hasThirdReductionLoop())
+    os << "r2 == 0 && r1 == 0 && c2 == 0 && c5 == 0";
+  else if (contraction.hasExtraReductionLoop())
     os << "r1 == 0 && c2 == 0 && c5 == 0";
   else
     os << "c2 == 0 && c5 == 0";
 }
 
 void SystolicHLSEmitter::emitPEDrainCondition(unsigned c5Bound) {
-  if (contraction.hasExtraReductionLoop())
+  if (contraction.hasThirdReductionLoop())
+    os << "r2 == " << (size - 1) << " && r1 == " << (size - 1) << " && c2 == " << (numTiles - 1) << " && c5 == " << (c5Bound - 1);
+  else if (contraction.hasExtraReductionLoop())
     os << "r1 == " << (size - 1) << " && c2 == " << (numTiles - 1) << " && c5 == " << (c5Bound - 1);
   else
     os << "c2 == " << (numTiles - 1) << " && c5 == " << (c5Bound - 1);
@@ -797,6 +868,7 @@ void SystolicHLSEmitter::emitPE() {
   unsigned c5Bound = arrayPart / simd;
   const std::string &out = outputName;
   bool extraReduction = contraction.hasExtraReductionLoop();
+  bool thirdReduction = contraction.hasThirdReductionLoop();
   os << "/* Module Definition */\n";
   os << "void PE(int idx, int idy, ";
   for (size_t i = 0; i < inputNames.size(); i++)
@@ -810,14 +882,16 @@ void SystolicHLSEmitter::emitPE() {
   }
   os << "  " << out << "_t1 local_" << out << "[" << latency << "][" << latency << "];\n";
   os << "  #pragma HLS RESOURCE variable=local_" << out << " core=RAM_2P_BRAM\n";
-  os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-  os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
-  os << "      for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  os << "  for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+  os << "    for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
+  os << "      for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+  if (thirdReduction)
+    os << "        for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
   if (extraReduction)
-    os << "        for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
-  os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1) {\n";
-  os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1) {\n";
-  os << "            for (ap_uint<3> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
+    os << "        for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+  os << "        for (ap_uint<" << bitsC5Bound << "> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1) {\n";
+  os << "          for (ap_uint<" << bitsLatency << "> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1) {\n";
+  os << "            for (ap_uint<" << bitsLatency << "> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
   os << "            #pragma HLS PIPELINE II=1\n";
   os << "              {\n";
   for (const auto &in : inputNames)
@@ -839,6 +913,8 @@ void SystolicHLSEmitter::emitPE() {
   os << "          }\n";
   os << "        }\n";
   if (extraReduction)
+    os << "        }\n";
+  if (thirdReduction)
     os << "        }\n";
   os << "      }\n";
   os << "}\n";
@@ -863,22 +939,27 @@ void SystolicHLSEmitter::emitPEWrapper() {
 void SystolicHLSEmitter::emitDummyModules() {
   unsigned c5Bound = arrayPart / simd;
   bool doubleReduction = contraction.hasExtraReductionLoop();
+  bool thirdReduction = contraction.hasThirdReductionLoop();
   for (const auto &in : inputNames) {
     os << "/* Module Definition */\n";
     os << "void " << in << "_PE_dummy_in(int idx, int idy, hls::stream<float> &fifo_" << in << "_in) {\n";
     os << "  int p0 = idx, p1 = idy;\n";
-    os << "  for (ap_uint<3> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
-    os << "    for (ap_uint<3> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
-    os << "      for (ap_uint<3> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+    os << "  for (ap_uint<" << bitsTiles << "> c0 = 0; c0 <= " << (numTiles - 1) << "; c0 += 1)\n";
+    os << "    for (ap_uint<" << bitsTiles << "> c1 = 0; c1 <= " << (numTiles - 1) << "; c1 += 1)\n";
+    os << "      for (ap_uint<" << bitsTiles << "> c2 = 0; c2 <= " << (numTiles - 1) << "; c2 += 1) {\n";
+    if (thirdReduction)
+      os << "        for (ap_uint<" << bitsSize << "> r2 = 0; r2 <= " << (size - 1) << "; r2 += 1) {\n";
     if (doubleReduction)
-      os << "        for (ap_uint<4> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
-    os << "        for (ap_uint<4> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1)\n";
-    os << "          for (ap_uint<3> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1)\n";
-    os << "            for (ap_uint<3> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
+      os << "        for (ap_uint<" << bitsSize << "> r1 = 0; r1 <= " << (size - 1) << "; r1 += 1) {\n";
+    os << "        for (ap_uint<" << bitsC5Bound << "> c5 = 0; c5 <= " << (c5Bound - 1) << "; c5 += 1)\n";
+    os << "          for (ap_uint<" << bitsLatency << "> c6 = 0; c6 <= " << (latency - 1) << "; c6 += 1)\n";
+    os << "            for (ap_uint<" << bitsLatency << "> c7 = 0; c7 <= " << (latency - 1) << "; c7 += 1) {\n";
     os << "            #pragma HLS PIPELINE II=1\n";
     os << "              " << in << "_t1 fifo_data; fifo_data = fifo_" << in << "_in.read();\n";
     os << "            }\n";
     if (doubleReduction)
+      os << "        }\n";
+    if (thirdReduction)
       os << "        }\n";
     os << "      }\n";
     os << "}\n";
@@ -1239,13 +1320,18 @@ void SystolicHLSEmitter::emitDrainIOL3(StringRef arrayName) {
 void SystolicHLSEmitter::emitDrainSerialize(StringRef arrayName, unsigned totalSize,
                                             llvm::ArrayRef<int64_t> outShape) {
   // C_drain_IO_L3_out_serialize
-  unsigned packFactor = 16 / latency;
-  unsigned floatsPerWord = 16;
-  // Default 2D: totalSize x totalSize
-  unsigned iterations = (totalSize * totalSize * 4) / 64;
+  unsigned packFactor = kFloatsPerDramWord / latency;
+  unsigned floatsPerWord = kFloatsPerDramWord;
+  // 由 outputShape 推导写回字数；无 shape 时退化为 totalSize^2（2D 方阵）
+  unsigned iterations;
   if (outShape.size() == 3) {
     uint64_t totalElements3 = (uint64_t)outShape[0] * outShape[1] * outShape[2];
-    iterations = (unsigned)((totalElements3 * 4) / 64);
+    iterations = (unsigned)((totalElements3 * 4) / kDramWordBytes);
+  } else if (outShape.size() >= 2) {
+    uint64_t totalElements2 = (uint64_t)outShape[0] * outShape[1];
+    iterations = (unsigned)((totalElements2 * 4) / kDramWordBytes);
+  } else {
+    iterations = (totalSize * totalSize * 4) / kDramWordBytes;
   }
 
   os << "/* Module Definition */\n";
@@ -1284,7 +1370,7 @@ void SystolicHLSEmitter::emitDrainSerialize(StringRef arrayName, unsigned totalS
     unsigned s1 = (unsigned)info.originalDims[1];
     unsigned s2 = (unsigned)info.originalDims[2];
     uint64_t totalElements = (uint64_t)s0 * s1 * s2;
-    unsigned iter3 = (unsigned)((totalElements * 4) / 64);
+    unsigned iter3 = (unsigned)((totalElements * 4) / kDramWordBytes);
     auto origExprs = getOriginalIndexExprs3D(arrayName, "d0", "d1", "d2");
     unsigned r0 = info.reorderedDims.size() >= 3 ? (unsigned)info.reorderedDims[0] : s0;
     unsigned r1 = info.reorderedDims.size() >= 3 ? (unsigned)info.reorderedDims[1] : s1;
@@ -1366,7 +1452,7 @@ void SystolicHLSEmitter::emitDrainSerialize(StringRef arrayName, unsigned totalS
                       ? (unsigned)it2d->second.originalDims[1]
                       : totalSize;
     unsigned totalElements2d = s0 * s1;
-    unsigned iterations2d = (totalElements2d * 4) / 64;
+    unsigned iterations2d = (totalElements2d * 4) / kDramWordBytes;
     unsigned loopBits0 = (unsigned)ceil(log2(s0 + 1));
     unsigned loopBits1 = (unsigned)ceil(log2(s1 + 1));
     auto origExprs = getOriginalIndexExprs2D(arrayName, "d0", "d1");
@@ -1461,6 +1547,7 @@ void SystolicHLSEmitter::emitDrainSerialize(StringRef arrayName, unsigned totalS
 
 void SystolicHLSEmitter::emitTopKernel(func::FuncOp funcOp) {
   const std::string &out = outputName;
+  // 保留 kernel0 以兼容现有 host/e2e；后续可改为 funcOp.getName() 或 --kernel-name 选项
   os << "extern \"C\" {\n";
   os << "void kernel0(";
   for (size_t idx = 0; idx < inputNames.size(); idx++)
@@ -1794,13 +1881,17 @@ LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
   auto funcOps = module.getOps<func::FuncOp>();
   func::FuncOp kernelFunc;
   if (!funcOps.empty()) {
-    // Prefer the kernel that has systolic.reorder attrs (entry point after transform);
-    // otherwise the non-private one; otherwise the first.
-    for (func::FuncOp f : funcOps)
-      if (f->getAttr("systolic.reorder.arg0.dims") || f->getAttr("systolic.reorder.arg1.dims") ||
-          f->getAttr("systolic.reorder.arg2.dims") || f->getAttr("systolic.reorder.arg3.dims") ||
-          f->getAttr("systolic.reorder.C.dims"))
-        { kernelFunc = f; break; }
+    // Prefer the kernel that has any systolic.reorder.*.dims (entry point after transform).
+    for (func::FuncOp f : funcOps) {
+      for (const auto &attr : f->getAttrs()) {
+        StringRef name = attr.getName().getValue();
+        if (name.starts_with("systolic.reorder.") && name.ends_with(".dims")) {
+          kernelFunc = f;
+          break;
+        }
+      }
+      if (kernelFunc) break;
+    }
     if (!kernelFunc)
       for (func::FuncOp f : funcOps)
         if (!f.isPrivate())
@@ -1848,7 +1939,7 @@ LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
           ? ContractionDesc::Kind::MttkrpLike
           : ContractionDesc::Kind::MatmulLike;
     } else if (contraction.outputRank == 3) {
-      if (contraction.numReductions <= 2)
+      if (contraction.numReductions <= 3)
         contraction.kind = ContractionDesc::Kind::TtmcLike;
       else
         contraction.kind = ContractionDesc::Kind::Unsupported;
@@ -1858,8 +1949,8 @@ LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
 
     if (contraction.kind == ContractionDesc::Kind::Unsupported) {
       llvm::errs() << "systolic-translate error: unsupported output rank " << contraction.outputRank;
-      if (contraction.outputRank == 3 && contraction.numReductions > 2)
-        llvm::errs() << " (num_time_loops " << contraction.numReductions << " > 2 not yet supported)";
+      if (contraction.outputRank == 3 && contraction.numReductions > 3)
+        llvm::errs() << " (num_time_loops " << contraction.numReductions << " > 3 not supported)";
       llvm::errs() << ".\n  Function: " << kernelFunc.getName() << "\n";
       return failure();
     }
@@ -1867,7 +1958,17 @@ LogicalResult SystolicHLSEmitter::emit(ModuleOp module) {
     inputNames.assign({"A", "B"});
     outputName = "C";
   }
-  
+
+  {
+    unsigned c5B = arrayPart / simd;
+    if (c5B == 0) c5B = 1;
+    bitsTiles = requiredLoopBits(numTiles > 0 ? (uint64_t)numTiles - 1 : 0);
+    bitsPE = requiredLoopBits(numPE > 0 ? (uint64_t)numPE - 1 : 0);
+    bitsSize = requiredLoopBits(size > 0 ? (uint64_t)size - 1 : 0);
+    bitsLatency = requiredLoopBits(latency > 0 ? (uint64_t)latency - 1 : 0);
+    bitsC5Bound = requiredLoopBits((uint64_t)c5B - 1);
+  }
+
   emitFileHeader();
   emitTypeDefinitions();
   emitModuleDeclarations();

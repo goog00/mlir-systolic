@@ -1,7 +1,7 @@
 # 当前实现状态与下一步工作
 
-> **更新日期**: 2026-03-02  
-> **目的**: 结合文档与源码、实际运行结果，梳理「已实现」与「按设想下一步应完成」的工作。
+> **更新日期**: 2026-03  
+> **目的**: 结合文档与源码梳理已实现与下一步。**最新下一步与阶段清单**见根目录 [RECENT_CHANGES_AND_NEXT_STEPS.md](../../RECENT_CHANGES_AND_NEXT_STEPS.md) 与 [PHASE_CODEGEN_AND_HLS_TEST.md](PHASE_CODEGEN_AND_HLS_TEST.md)。
 
 ---
 

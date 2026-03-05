@@ -1,7 +1,7 @@
 # mlir-systolic 项目状态与上手指南
 
 > **用途**：在新环境（例如服务器）或新 Agent 接手时，快速了解当前做了什么、如何验证、下一步该做什么。  
-> **最后更新**：2026-03-04
+> **最后更新**：2026-03
 
 ---
 
@@ -12,14 +12,15 @@
 - **当前能力**：
   - **Pass 链**：`systolic-write-reorder-analysis`（可选）→ `systolic-transform` → `systolic-dataflow-generation` → 生成 SystolicDataflow IR；再由 **systolic-translate** 生成 HLS C++。
   - **支持的 kernel**：MM（矩阵乘）、MTTKRP（4 循环）、写时重排 2D/3D 测例；模板支持最多 3 输入 + 1 输出。
-  - **已做优化**：写时重排（2D/3D）、读时重排（2D）、L3 coalesced 读（tile 顺序 + word_idx）、FIFO 深度可配置、RESOURCE 系统化（FIFO_SRL/RAM_2P_BRAM）、Pipeline 内 %/ 强度削减（2 的幂时用位运算）、L2 声明/定义维度一致。
+  - **已做优化**：写时重排（2D/3D）、读时重排（2D）、L3 coalesced 读（tile 顺序 + word_idx）、FIFO 深度可配置、RESOURCE 系统化（FIFO_SRL/RAM_2P_BRAM）、Pipeline 内 %/ 强度削减（2 的幂时用位运算）、L2 声明/定义维度一致；**DRAM/打包常量**与**循环变量位宽按 bound 动态计算**；**L2 与 c2 语义修复**（每 c2 先 inter_trans 再 intra_trans，L3 按 c2 重复输出，见 [HLS_SEMANTIC_AUDIT](docs/design/HLS_SEMANTIC_AUDIT.md)）。
+- **设计原则**：后续改进可**参考 AutoSA 的流程与结构**（其在 PPCG 上已验证），同时**保留 MLIR 优势与既有改进**；见 [docs/design/CODEGEN_REFACTOR_ASSESSMENT.md](docs/design/CODEGEN_REFACTOR_ASSESSMENT.md) 第 0 节。
 
-### 当前阶段结论（2026-03-04）
+### 当前阶段结论（2026-03）
 
-- **目标收敛**：从“先比性能”切换为“先语义正确（csim）”。
-- **标准 MTTKRP**：已建立标准语义用例并复现 csim mismatch，详见 `hls_validation/mttkrp_std_mlirsystolic/CSIM_FINDINGS_2026-03-04.md`。
-- **标准 TTMc**：当前仍受 rank-3 输出模板能力限制；translate 中对非 2D 输出已做保护性拦截。
-- **设计路线**：已形成对比与通用化方案，详见 [docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md)。
+- **目标**：先语义正确（csim），再性能对比。
+- **MM 语义**：已修复 L2/c2 对应关系（每 c2 使用新加载数据）；待服务器 C sim 确认。
+- **标准 MTTKRP / TTMc**：双规约 r1、三规约 r2 已支持；MTTKRP csim 曾见 mismatch，见 `hls_validation/mttkrp_std_mlirsystolic/`。
+- **设计路线**：见 [docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md](docs/design/CODEGEN_COMPARISON_AND_GENERALIZATION_PLAN.md)、[docs/status/PHASE_CODEGEN_AND_HLS_TEST.md](docs/status/PHASE_CODEGEN_AND_HLS_TEST.md)。
 
 ---
 
@@ -54,11 +55,22 @@ git submodule update --init --recursive
 ./test/run_all_e2e.sh
 ```
 
-- 会跑：MM、MTTKRP、写时重排(2D)、写时重排(3D) 四个 e2e。
-- 成功时输出「通过: 4 … 结果: 全部通过」。
-- 生成文件在 `/tmp/`：`mm_e2e_out.cpp`、`mttkrp_e2e_out.cpp`、`reorder_e2e_out.cpp`、`reorder_3d_e2e_out.cpp`。
+- 会跑：MM、MTTKRP、标准 TTMc、写时重排(2D)、写时重排(3D) 共五个 e2e。
+- 成功时输出「通过: 5 … 结果: 全部通过」。
+- 生成文件在 `/tmp/`：`mm_e2e_out.cpp`、`mttkrp_e2e_out.cpp`、`ttmc_std_e2e_out.cpp`、`reorder_e2e_out.cpp`、`reorder_3d_e2e_out.cpp`。
 
-### 2.3 单独测 MM 或写时重排
+### 2.3 生成供服务器 HLS 测试的代码（MM、MTTKRP、TTMc + 写时重排版）
+
+```bash
+./test/generate_hls_for_server.sh [输出目录]
+# 默认输出: build/hls_for_server/
+# 生成: mm.cpp, mttkrp_std.cpp, mttkrp_std_reorder.cpp, ttmc_std.cpp, ttmc_std_reorder.cpp
+# 可将该目录打包到服务器进行 HLS 综合与 C sim。
+```
+
+详见 **[docs/status/PHASE_CODEGEN_AND_HLS_TEST.md](docs/status/PHASE_CODEGEN_AND_HLS_TEST.md)**（本阶段清单与后续改进）。
+
+### 2.4 单独测 MM 或写时重排
 
 ```bash
 ./test/run_mm_e2e.sh
@@ -66,7 +78,7 @@ git submodule update --init --recursive
 ./test/run_reorder_3d_e2e.sh
 ```
 
-### 2.4 写时重排测例的 Pass 顺序
+### 2.5 写时重排测例的 Pass 顺序
 
 写时重排测例需要**先**跑写重排分析，再跑 transform 与 dataflow，例如：
 

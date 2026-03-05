@@ -31,6 +31,7 @@ check_file() {
   fi
   echo "--- $name ($path) ---"
   echo "  PE/IO 内 r1 循环: $(count_in "r1" "$path")"
+  echo "  PE/IO 内 r2 循环: $(count_in "r2" "$path")"
   echo "  word_idx 含 r1: $(count_in "word_idx.*r1" "$path")"
   echo "  注释 3D r1=plane: $(count_in "r1 = plane" "$path")"
   echo "  buffer_linear: $(count_in "buffer_linear" "$path")"
@@ -40,8 +41,9 @@ check_file() {
 
 check_file "/tmp/mm_e2e_out.cpp" "MM"
 check_file "/tmp/mttkrp_e2e_out.cpp" "MTTKRP_std"
+check_file "/tmp/ttmc_std_e2e_out.cpp" "标准TTMc"
 check_file "/tmp/reorder_e2e_out.cpp" "写时重排(2D)"
-check_file "/tmp/reorder_3d_e2e_out.cpp" "写时重排(3D)" "translate 因 rank-3 输出不支持未生成"
+check_file "/tmp/reorder_3d_e2e_out.cpp" "写时重排(3D)"
 
 echo ""
 echo "说明: 本地仅做生成与模式检查；HLS csim/综合留待阶段性工作结束后在服务器统一进行。"

@@ -1,7 +1,9 @@
 # 项目状态（概览版）
 
-**最后更新**: 2026-01-06 (更新：反映 ParametricSpaceTime 框架实现状态)  
-**状态**: 核心功能已可用，正推进多配置/多 kernel 支持
+> **说明**：本文档为历史概览；**当前状态与下一步**请以根目录 [PROJECT_STATUS_AND_ONBOARDING.md](../../PROJECT_STATUS_AND_ONBOARDING.md)、[RECENT_CHANGES_AND_NEXT_STEPS.md](../../RECENT_CHANGES_AND_NEXT_STEPS.md) 及 [PHASE_CODEGEN_AND_HLS_TEST.md](PHASE_CODEGEN_AND_HLS_TEST.md) 为准。
+
+**最后更新**: 2026-01（概览）；当前阶段见上文链接  
+**状态**: 核心功能已可用，多 kernel（MM/MTTKRP/TTMc）与 L2/c2 语义修复已完成
 
 ---
 

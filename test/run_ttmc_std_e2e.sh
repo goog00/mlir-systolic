@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 标准语义 TTMc e2e: opt -> translate（当前期望失败，因 rank-3 输出尚不支持）
+# 标准语义 TTMc e2e: opt -> translate（期望成功，rank-3 + num_time_loops=3 已支持）
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -22,22 +22,10 @@ SIMD=1
 
 "$OPT" "$INPUT" --systolic-transform --systolic-dataflow-generation -o "$OUT_MLIR"
 
-set +e
-"$TRANS" "$OUT_MLIR" --size=$SIZE --array-part=$ARRAY_PART --latency=$LATENCY --simd=$SIMD -o "$OUT_CPP" 2>"$ERR_LOG"
-RC=$?
-set -e
+"$TRANS" "$OUT_MLIR" --size=$SIZE --array-part=$ARRAY_PART --latency=$LATENCY --simd=$SIMD -o "$OUT_CPP" 2>"$ERR_LOG" || { echo "FAIL: TTMc translate failed."; cat "$ERR_LOG"; exit 1; }
 
-if [[ $RC -eq 0 ]]; then
-  echo "FAIL: TTMc translate unexpectedly succeeded; rank-3 output support check may be bypassed."
-  exit 1
-fi
+[[ -f "$OUT_CPP" ]] || { echo "FAIL: no output cpp: $OUT_CPP"; exit 1; }
+# 三规约维应生成 r2 循环
+grep -q "r2" "$OUT_CPP" || { echo "FAIL: expected r2 loop in TTMc output."; exit 1; }
 
-if ! grep -q "unsupported output rank 3" "$ERR_LOG"; then
-  echo "FAIL: translate failed, but not with expected rank-3 unsupported message."
-  echo "---- stderr ----"
-  cat "$ERR_LOG"
-  echo "--------------"
-  exit 1
-fi
-
-echo "PASS: Standard TTMc e2e got expected failure (rank-3 unsupported)."
+echo "PASS: Standard TTMc e2e (translate success, r2 present)."
